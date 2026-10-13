@@ -1,0 +1,2 @@
+/usr/bin/ar qc libemp-tool.a "CMakeFiles/emp-tool.dir/emp-tool/ir/assets.cpp.o" "CMakeFiles/emp-tool.dir/emp-tool/ir/builtins.cpp.o" "CMakeFiles/emp-tool.dir/emp-tool/runtime/crypto/ec.cpp.o"
+/usr/bin/ranlib libemp-tool.a
