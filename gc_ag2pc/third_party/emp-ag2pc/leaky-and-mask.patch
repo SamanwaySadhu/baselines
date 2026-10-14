@@ -1,0 +1,99 @@
+--- a/emp-ag2pc/backend/triple_pool.h	2026-10-13 08:05:46.077714613 +0000
++++ b/emp-ag2pc/backend/triple_pool.h	2026-10-13 10:03:42.046327494 +0000
+@@ -1,3 +1,7 @@
++// MODIFIED by the gc_ag2pc baseline (not upstream emp-ag2pc a245ca0): in
++// compute_inplace, the leaky-AND's leaky input is fresh randomness instead of the
++// gate's real wire mask, and the leaky-AND hash seed is separated per call. See
++// third_party/emp-ag2pc/README.md and the *.patch files next to it.
+ #ifndef TRIPLE_POOL_H__
+ #define TRIPLE_POOL_H__
+ #include "emp-ag2pc/backend/helper.h"
+@@ -54,6 +58,7 @@
+ class TriplePool {
+ public:
+   ThreadPool *pool;
++  uint64_t inplace_calls_ = 0;  // compute_inplace calls with num_ands > 0 (MITCCRH seed separation)
+   int party;
+   // Statistical security parameter: get_bucket_size targets residual leakage
+   // ≤ 2^{-ssp} when picking B (see its comment for the bound).
+@@ -406,12 +411,11 @@
+   }
+ 
+   // In-place (function-dependent) AND-share generation (KRRW §5.2 bucket-saving).
+-  // For each AND gate the bucket's representative (layer 0) is the leaky-AND of the
+-  // gate's OWN input wire masks (rep_a = λ_α, rep_b = λ_β) instead of fresh random
+-  // (a,b); only its output randomness r is freshly COT'd. The B-1 sacrifice layers
+-  // are fresh generic candidates. So per gate we mint (3B-2)·num_ands
+-  // COTs (vs 3B·num_ands generic) and the Beaver x/y reconciliation is gone — the
+-  // representative is already on the real masks. out_sigma[ai] is the authenticated
++  // For each AND gate the bucket's representative (layer 0) uses the gate's OWN
++  // input mask λ_β as its kept (non-leaky) b-input; its leaky a-input and output
++  // randomness r are fresh COT (see the MODIFIED note below). The B-1 sacrifice
++  // layers are fresh generic candidates. So per gate we mint (3B-1)·num_ands COTs
++  // (vs 3B·num_ands generic), and only the a-side Beaver reconcile is needed. out_sigma[ai] is the authenticated
+   // share of σ = λ_α∧λ_β (bit0(mac)=σ, bit0(key)=0), drop-in for the garbler /
+   // evaluator. λ_γ stays a fresh independent wire mask (kept by the caller), so the
+   // construction is constant-round.
+@@ -421,8 +425,13 @@
+     if (num_ands == 0) return;   // AND-free chunk (e.g. an output-only checkpoint)
+     const int B = get_bucket_size(num_ands);
+     const int L = num_ands;
+-    const block pair_seed = makeBlock((uint64_t)std::min(party, 3 - party),
+-                                      (uint64_t)std::max(party, 3 - party));
++    // MODIFIED (gc_ag2pc baseline): the call counter separates the hash tweaks of
++    // successive calls (one per protocol chunk); upstream reused the same seed, and
++    // MITCCRH::setS restarts its gate id, so tweaks repeated across chunks. Both
++    // parties make the same sequence of calls, so they agree on the seed.
++    const block pair_seed = makeBlock(inplace_calls_++,
++                                      ((uint64_t)std::min(party, 3 - party) << 8) |
++                                          (uint64_t)std::max(party, 3 - party));
+     MITCCRH<8> gmitc, emitc;
+     gmitc.setS(pair_seed);
+     emitc.setS(pair_seed);
+@@ -431,15 +440,27 @@
+     g_tp_cot_ns = g_tp_hg_ns = 0;
+     g_tp_sopen_ns = g_tp_feq_ns = g_tp_bkt_ns = 0;
+ #endif
+-    // layer 0 (acc): region a = λ_α, b = λ_β (copied wire masks, no COT); region r
+-    // = fresh COT (the representative's only minted share).
++    // layer 0 (acc): region b = λ_β (copied wire mask, no COT); regions a and r =
++    // fresh COT.
++    //
++    // MODIFIED (gc_ag2pc baseline): upstream a245ca0 also copied λ_α into region a.
++    // Region a is the LEAKY input of the leaky-AND: the evaluator half selects on
++    // its a-share bit (leaky_and_halfgate, `select_mask[LSB(mac[k])]`), so a
++    // malicious peer that adds an error to G makes the batched F_eq abort iff the
++    // honest a-share is 1. With a = λ_α that selective failure reveals the honest
++    // party's share of a real wire mask, hence (with the public Λ) the wire value.
++    // WRK17 bucketing only protects a leaky input that is fresh randomness combined
++    // across the bucket, so region a is now fresh COT, and λ_α is reached through
++    // the Beaver reconcile below (xb = λ_α ⊕ X, which the generic σ derivation
++    // already supports). Region b (the kept, non-leaky input) stays λ_β, so yb = 0.
++    // Cost: one more COT per AND gate (3B-1 instead of 3B-2).
+     BlockVec acc_mac((size_t)3 * L), acc_key((size_t)3 * L);
+     for (int i = 0; i < L; ++i) {
+-      acc_mac[i]     = rep_a[i].mac;  acc_key[i]     = rep_a[i].key;
+       acc_mac[L + i] = rep_b[i].mac;  acc_key[L + i] = rep_b[i].key;
+     }
+     // One running F_eq hash over every layer's L-vector; checked once below.
+     Hash feq;
++    gen_cot_shares(acc_mac.data(), acc_key.data(), L);                   // region a
+     gen_cot_shares(acc_mac.data() + 2 * L, acc_key.data() + 2 * L, L);   // region r
+     leaky_and_halfgate(acc_mac.data(), acc_key.data(), L, gmitc, emitc, feq);
+     AG2PC_TP("in-place layer 0 (rep + r + leaky)");
+@@ -459,12 +480,13 @@
+     }
+     AG2PC_TP("F_eq (batched)");
+     // The bucketing combines the a-inputs, so acc now holds a valid triple
+-    // (X, Y, Z=X∧Y) with X = λ_α ⊕ Σ(sacrifice a) and Y = λ_β (the b-region is
++    // (X, Y, Z=X∧Y) with X = Σ(fresh a over all layers) and Y = λ_β (the b-region is
+     // kept, not combined). Reconcile (X,Y) back to (λ_α,λ_β) with the Beaver
+     // opening xb = λ_α⊕X, yb = λ_β⊕Y, then σ = Z ⊕ xb·Y ⊕ yb·X (+ the xb·yb
+     // λ_{αβ}⊕=1 correction) — the proven generic σ derivation. With the in-place
+     // representative yb is identically 0 (Y already = λ_β), so this opens
+-    // num_ands bits on the a-side; the b-side reveal is the constant 0.
++    // num_ands bits on the a-side (xb = λ_α ⊕ X, uniform because X is fresh
++    // bucketed randomness); the b-side reveal is the constant 0.
+     std::vector<unsigned char> xb_me(L), yb_me(L), xb_pe(L), yb_pe(L);
+     for (int i = 0; i < L; ++i) {
+       xb_me[i] = (unsigned char)(LSB(rep_a[i].mac) ^ LSB(acc_mac[i]));

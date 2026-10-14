@@ -1,0 +1,175 @@
+--- a/emp-ag2pc/backend/protocol.h	2026-10-13 08:05:46.077714613 +0000
++++ b/emp-ag2pc/backend/protocol.h	2026-10-13 09:55:14.210737054 +0000
+@@ -1,3 +1,7 @@
++// MODIFIED by the gc_ag2pc baseline (not upstream emp-ag2pc a245ca0): the input
++// phase of AG2PCProtocol::process_inputs was rewritten so that a party's private
++// inputs are no longer sent to the other party in the clear. See
++// third_party/emp-ag2pc/README.md and third_party/emp-ag2pc/input-privacy.patch.
+ #ifndef EMP_AG2PC_PROTOCOL_H__
+ #define EMP_AG2PC_PROTOCOL_H__
+ #include "emp-ag2pc/backend/triple_pool.h"
+@@ -98,13 +102,12 @@
+   // owner. Internally:
+   //   - fpre->draw mints all n_total authenticated λ-shares (one COT batch)
+   //   - the garbler samples m_{w, 0} for every wire
+-  //   - authenticated share open: each party ships (its λ^self bits + Hash of
+-  //     the matching MACs) plus, in the same message, the x_w bits for the
+-  //     wires it owns. Sent in parallel on the duplex pair so the whole
+-  //     exchange is one one-way latency. Hashes are verified before Γ is used.
++  //   - authenticated open of λ_w to the wire's owner only: the non-owner
++  //     ships its λ^self bit (+ Hash of the matching MACs), verified by the
++  //     owner before use
++  //   - the owner ships Γ_w = x_w ⊕ λ_w (never x_w)
+   //   - the garbler ships m_{w,Γ_w} = label0 ⊕ Γ_w·Δ for all wires (one-way).
+-  // Net: 2 message rounds (~1 RTT) for the whole input phase, regardless of
+-  // owner count.
++  // Net: 3 one-way messages for the whole input phase, regardless of owner count.
+   std::vector<SecureWires> process_inputs(
+       const std::vector<int> &owners,
+       const std::vector<std::vector<uint8_t>> &bits_per_owner);
+@@ -198,71 +201,95 @@
+     }
+   }
+ 
+-  // KRRW Fig.3 authenticated share open + (folded into the same message) the
+-  // owner's x_w bits, both directions in parallel on the duplex pair.
++  // KRRW Fig.3 / WRK17 input phase, in two message rounds (each sent in
++  // parallel on the duplex pair):
+   //
+-  // Each party ships:
+-  //   (a) λ^self bits for ALL wires (n_total bytes) — the raw share open
+-  //   (b) Hash of the matching MACs (DIGEST_SIZE bytes) — authenticates (a);
+-  //       peer recomputes expected MAC = K_peer ⊕ bit · Δ_peer from its own
+-  //       wire_bundle.key + Delta, hashes those, compares — abort on mismatch.
+-  //   (c) own_x_bits packed for wires this party owns (n_owned bytes) — the
+-  //       unauthenticated owner contribution Γ_w := x_w ⊕ λ_w gets folded in
+-  //       by the recipient using (a) + own λ^self below. Γ_w itself is bound
+-  //       downstream by the c_γ check that runs at chunk end.
+-  std::vector<unsigned char> share_msg(n_total);
+-  BlockVec my_macs(n_total);
+-  for (int i = 0; i < n_total; ++i) {
+-    share_msg[i] = (unsigned char)LSB(sw.wire_bundle[i].mac);
+-    my_macs[i]   = sw.wire_bundle[i].mac;
+-  }
+-  char D_me[Hash::DIGEST_SIZE];
+-  Hash::hash_once(D_me, my_macs.data(), (size_t)n_total * sizeof(block));
++  //   Round 1 — authenticated open of λ_w to the wire's OWNER only. For every
++  //   wire the PEER owns, each party ships its λ^self bit plus, once, the Hash
++  //   of the matching MACs; the owner recomputes the expected MACs from its own
++  //   keys (K ⊕ bit·Δ), compares the digests and aborts on mismatch. A party
++  //   never opens its share of a mask on a wire it owns, so the non-owner never
++  //   learns λ_w.
++  //
++  //   Round 2 — the owner sends Γ_w = x_w ⊕ λ_w (never x_w itself) for its own
++  //   wires. Γ_w is uniformly random to the non-owner because λ_w is. Γ_w is
++  //   bound downstream by the c_γ check that runs at chunk end.
++  //
++  // (Upstream a245ca0 opened BOTH shares of every input mask to BOTH parties
++  // and then shipped the owner's raw x_w bits, which handed every private
++  // input to the other party in the clear.)
++  std::vector<int> mine_idx, peer_idx;  // wires this party owns / the peer owns
++  for (int i = 0; i < n_total; ++i)
++    (owner_of_wire[i] == party ? mine_idx : peer_idx).push_back(i);
++  const int n_mine = (int)mine_idx.size(), n_peer = (int)peer_idx.size();
+ 
+-  std::vector<unsigned char> own_x_packed;
+-  std::vector<int> peer_idx_list;             // wire indices peer owns
+-  for (int i = 0; i < n_total; ++i) {
+-    if (owner_of_wire[i] == party) own_x_packed.push_back(own_x_bits[i]);
+-    else                            peer_idx_list.push_back(i);
++  // Round 1: my λ-shares on the peer's wires (to the peer); the peer's λ-shares
++  // on my wires (from the peer).
++  std::vector<unsigned char> share_to_peer(n_peer);
++  BlockVec macs_to_peer(n_peer);
++  for (int k = 0; k < n_peer; ++k) {
++    share_to_peer[k] = (unsigned char)LSB(sw.wire_bundle[peer_idx[k]].mac);
++    macs_to_peer[k]  = sw.wire_bundle[peer_idx[k]].mac;
+   }
++  char D_me[Hash::DIGEST_SIZE];
++  if (n_peer > 0) Hash::hash_once(D_me, macs_to_peer.data(), (size_t)n_peer * sizeof(block));
+ 
+-  std::vector<unsigned char> peer_share(n_total);
++  std::vector<unsigned char> peer_share(n_mine);
+   char D_peer[Hash::DIGEST_SIZE];
+-  std::vector<unsigned char> peer_x_packed(peer_idx_list.size());
+   {
+     std::vector<std::future<void>> res;
+     res.push_back(pool->enqueue([&]() {
+-      send_io->send_data(share_msg.data(), n_total);
+-      send_io->send_data(D_me, Hash::DIGEST_SIZE);
+-      if (!own_x_packed.empty())
+-        send_io->send_data(own_x_packed.data(), own_x_packed.size());
+-      send_io->flush();
++      if (n_peer > 0) {
++        send_io->send_data(share_to_peer.data(), n_peer);
++        send_io->send_data(D_me, Hash::DIGEST_SIZE);
++        send_io->flush();
++      }
+     }));
+     res.push_back(pool->enqueue([&]() {
+-      recv_io->recv_data(peer_share.data(), n_total);
+-      recv_io->recv_data(D_peer, Hash::DIGEST_SIZE);
+-      if (!peer_x_packed.empty())
+-        recv_io->recv_data(peer_x_packed.data(), peer_x_packed.size());
++      if (n_mine > 0) {
++        recv_io->recv_data(peer_share.data(), n_mine);
++        recv_io->recv_data(D_peer, Hash::DIGEST_SIZE);
++      }
+     }));
+     joinNclean(res);
+   }
+ 
+-  // Verify peer's MAC hash before using their share.
+-  BlockVec exp_macs(n_total);
+-  for (int i = 0; i < n_total; ++i)
+-    exp_macs[i] = sw.wire_bundle[i].key ^ (select_mask[peer_share[i]] & Delta);
+-  char D_exp[Hash::DIGEST_SIZE];
+-  Hash::hash_once(D_exp, exp_macs.data(), (size_t)n_total * sizeof(block));
+-  if (memcmp(D_exp, D_peer, Hash::DIGEST_SIZE) != 0)
+-    error("process_inputs: peer share-MAC hash mismatch");
++  // Verify the peer's MAC hash before using its shares.
++  if (n_mine > 0) {
++    BlockVec exp_macs(n_mine);
++    for (int k = 0; k < n_mine; ++k) {
++      peer_share[k] &= 1;
++      exp_macs[k] = sw.wire_bundle[mine_idx[k]].key ^ (select_mask[peer_share[k]] & Delta);
++    }
++    char D_exp[Hash::DIGEST_SIZE];
++    Hash::hash_once(D_exp, exp_macs.data(), (size_t)n_mine * sizeof(block));
++    if (memcmp(D_exp, D_peer, Hash::DIGEST_SIZE) != 0)
++      error("process_inputs: peer share-MAC hash mismatch");
++  }
+ 
+-  // Reconstruct Γ_w = λ_w ⊕ x_w = (λ^self ⊕ λ^peer) ⊕ x_w for every wire.
+-  // own_x_bits is 0 for peer-owned, so this folds in my own x only.
+-  for (int i = 0; i < n_total; ++i)
+-    sw.Lambda[i] = (unsigned char)(share_msg[i] ^ peer_share[i] ^ own_x_bits[i]);
+-  // Add peer's x bits for the wires they own.
+-  for (size_t i = 0; i < peer_idx_list.size(); ++i)
+-    sw.Lambda[peer_idx_list[i]] ^= peer_x_packed[i];
++  // Round 2: Γ_w = x_w ⊕ λ^self ⊕ λ^peer on my wires (to the peer); Γ_w on the
++  // peer's wires (from the peer).
++  std::vector<unsigned char> gamma_to_peer(n_mine);
++  for (int k = 0; k < n_mine; ++k) {
++    const int i = mine_idx[k];
++    gamma_to_peer[k] = (unsigned char)(LSB(sw.wire_bundle[i].mac) ^ peer_share[k] ^ own_x_bits[i]);
++    sw.Lambda[i] = gamma_to_peer[k];
++  }
++  std::vector<unsigned char> gamma_from_peer(n_peer);
++  {
++    std::vector<std::future<void>> res;
++    res.push_back(pool->enqueue([&]() {
++      if (n_mine > 0) {
++        send_io->send_data(gamma_to_peer.data(), n_mine);
++        send_io->flush();
++      }
++    }));
++    res.push_back(pool->enqueue([&]() {
++      if (n_peer > 0) recv_io->recv_data(gamma_from_peer.data(), n_peer);
++    }));
++    joinNclean(res);
++  }
++  for (int k = 0; k < n_peer; ++k) sw.Lambda[peer_idx[k]] = (unsigned char)(gamma_from_peer[k] & 1);
+ 
+   // Garbler ships m_{w,Γ_w} for every input wire.
+   if (party == 1) {

@@ -42,13 +42,18 @@ $SUDO cmake --install "$SRC/emp-tool/build"
 build emp-ot -DEMP_OT_BUILD_TESTS=OFF
 $SUDO cmake --install "$SRC/emp-ot/build"
 
-# emp-ag2pc is header-only and has no install rules at this commit: build its own
-# tests (sanity check) and copy the headers into the prefix.
+# emp-ag2pc is header-only and has no install rules at this commit. Build its own
+# tests (toolchain sanity check), then install the PATCHED headers from this repo's
+# third_party/emp-ag2pc -- upstream a245ca0 sends every private input to the other
+# party in the clear (see third_party/emp-ag2pc/README.md). The baseline itself always
+# builds against third_party/emp-ag2pc; this only keeps the prefix from carrying the
+# leaky upstream headers.
 build emp-ag2pc -DEMP_AG2PC_BUILD_TESTS=ON -DEMP_AG2PC_BUILD_EXAMPLES=OFF
 (cd "$SRC/emp-ag2pc" && ctest --test-dir build --output-on-failure)
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
 $SUDO rm -rf "$PREFIX/include/emp-ag2pc"
 $SUDO mkdir -p "$PREFIX/include"
-$SUDO cp -r "$SRC/emp-ag2pc/emp-ag2pc" "$PREFIX/include/emp-ag2pc"
+$SUDO cp -r "$REPO/third_party/emp-ag2pc/emp-ag2pc" "$PREFIX/include/emp-ag2pc"
 
 echo
 echo "EMP installed into $PREFIX"
