@@ -14,10 +14,10 @@ for d in $D_LIST; do
     JOB="sweep_d${d}_r${r}_$$"
     build/lr_mdml_dealer --offline-dir "$OFF" --job "$JOB" --d "$d" "$@" > results/sweep_dealer.log 2>&1 \
       || { echo "dealer failed for d=$d"; cat results/sweep_dealer.log; continue; }
-    build/lr_mdml server --port $PORT --offline-dir "$OFF" --job "$JOB" --quiet --d "$d" --csv "$OUT" "$@" \
+    build/lr_mdml server ${THREADS:+--threads $THREADS} --port $PORT --offline-dir "$OFF" --job "$JOB" --quiet --d "$d" --csv "$OUT" "$@" \
       > results/sweep_server.log 2>&1 &
     SPID=$!
-    build/lr_mdml client --port $PORT --offline-dir "$OFF" --job "$JOB" --quiet --d "$d" "$@" > results/sweep_client.log 2>&1
+    build/lr_mdml client ${THREADS:+--threads $THREADS} --port $PORT --offline-dir "$OFF" --job "$JOB" --quiet --d "$d" "$@" > results/sweep_client.log 2>&1
     wait $SPID || echo "run d=$d rep=$r failed (see results/sweep_server.log)"
     rm -f "$OFF/$JOB"-party-0.txt "$OFF/$JOB"-party-1.txt "$OFF/$JOB"-verify.txt
     echo "d=$d rep=$r: $(grep -m1 'TOTAL online' results/sweep_server.log | awk -F'|' '{print "online server ms:" $3}') $(grep -m1 'communication:' results/sweep_server.log)"

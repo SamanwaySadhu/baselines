@@ -33,6 +33,7 @@ endif()
 find_package(Boost 1.70 REQUIRED)   # header-only Boost.Asio
 find_package(OpenSSL 1.1 REQUIRED)  # SHA-256 commitments, AES-CTR coins (MAC check)
 find_package(Threads REQUIRED)
+find_package(OpenMP REQUIRED)       # multi-core online phase (see --threads)
 
 # MD-ML's FakeParty creates this directory; our programs pass absolute paths instead.
 set(FAKE_OFFLINE_DIR "${CMAKE_BINARY_DIR}/fake-offline-data")
@@ -43,7 +44,7 @@ add_library(mdml STATIC
 target_include_directories(mdml PUBLIC ${MDML_DIR}/src ${CMAKE_SOURCE_DIR}/include)
 target_include_directories(mdml SYSTEM PUBLIC ${Boost_INCLUDE_DIRS})
 target_compile_definitions(mdml PUBLIC FAKE_OFFLINE_DIR="${FAKE_OFFLINE_DIR}")
-target_link_libraries(mdml PUBLIC Eigen3::Eigen OpenSSL::Crypto Threads::Threads)
+target_link_libraries(mdml PUBLIC Eigen3::Eigen OpenSSL::Crypto Threads::Threads OpenMP::OpenMP_CXX)
 
 foreach(prog lr_mdml lr_mdml_dealer lr_mdml_selftest)
   add_executable(${prog} src/${prog}.cpp)

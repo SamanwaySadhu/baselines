@@ -44,6 +44,7 @@ struct Options {
   int port = 12345;
   std::string dir = "results/offline", job = "lr";
   bool verify = false, quiet = false;
+  int threads = 0;  // 0 = all cores
   Tamper tamper = Tamper::NONE;
   std::string json_path, csv_path;
 };
@@ -58,7 +59,8 @@ void usage(const char* prog) {
       "  --host IP          the OTHER party's address (default 127.0.0.1); both parties connect\n"
       "  --port N           base TCP port; ports N..N+3 are used (default 12345)\n"
       "  --offline-dir DIR  preprocessing directory (default results/offline)\n"
-      "  --job NAME         preprocessing file prefix (default lr)\n\n"
+      "  --job NAME         preprocessing file prefix (default lr)\n"
+      "  --threads N        OpenMP threads per party (default 0 = min(cores, 4); more rarely helps)\n\n"
       "output:\n"
       "  --verify           TEST ONLY: the server regenerates the client's data from --seed and\n"
       "                     checks the result bit-exactly (needs the dealer's <job>-verify.txt)\n"
@@ -87,6 +89,7 @@ Options parse_options(int argc, char** argv) {
     else if (a == "--job") O.job = r.next_value(a);
     else if (a == "--verify") O.verify = true;
     else if (a == "--quiet") O.quiet = true;
+    else if (a == "--threads") O.threads = (int)parse_int(r.next_value(a), a);
     else if (a == "--json") O.json_path = r.next_value(a);
     else if (a == "--csv") O.csv_path = r.next_value(a);
     else if (a == "--tamper") {
@@ -190,6 +193,7 @@ int main(int argc, char** argv) {
     return 1;
   }
   const Params& P = O.P;
+  set_threads(O.threads);
   const bool is_server = O.party == 1;
   const char* me = is_server ? "server" : "client";
 
@@ -229,6 +233,11 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "[%s] connected (%.2f s), preprocessing loaded (%.2f s); %s\n", me, rep.connect_s,
                  rep.load_s, params_string(P).c_str());
 
+    {  // expected size of the MAC logs: LTZ on 2B values per iteration = 2*118*2B + 2B binary openings
+      const size_t B = (size_t)P.batch, T = (size_t)P.iters;
+      ctx.reserve_openings(T * (4 * B + (size_t)P.d) + (size_t)P.d + 64,
+                           T * (size_t)(2 * ltz_ands() + 1) * 2 * B + 64);
+    }
     // ---------------- online phase ----------------
     ctx.exchange(std::vector<uint8_t>{1}, C_LOCAL);  // start together
     ctx.stat[C_LOCAL] = PhaseStat{};
@@ -289,6 +298,7 @@ int main(int argc, char** argv) {
     // ---------------- report ----------------
     std::printf("\n=== MD-ML logistic regression (2PC, malicious, online phase) -- %s view ===\n", me);
     std::printf("%s\n", params_string(P).c_str());
+    std::printf("threads per party: %d (machine has %u cores)\n", omp_get_max_threads(), std::thread::hardware_concurrency());
     std::printf("SPDZ2k k=s=64; binary SPDZ2k k=1,s=64 for LTZ; MAC check: %s\n\n", mac_ok ? "PASS" : "FAIL");
     std::printf("%-36s | %10s %10s | %10s %10s | %10s %10s | %6s\n", "phase (online)", "client ms", "client cpu",
                 "server ms", "server cpu", "c->s KiB", "s->c KiB", "rounds");

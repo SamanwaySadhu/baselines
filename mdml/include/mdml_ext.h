@@ -39,6 +39,8 @@
 #include "share/Spdz2kShare.h"
 #include "utils/linear_algebra.h"
 
+#include <omp.h>
+
 #include <openssl/evp.h>
 #include <openssl/rand.h>
 
@@ -46,6 +48,7 @@
 #include <array>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <functional>
@@ -108,6 +111,32 @@ inline double cpu_now_s() {
   return (double)ts.tv_sec + 1e-9 * (double)ts.tv_nsec;
 }
 
+// Multi-core: loops over at least kParMin independent elements run on all OpenMP threads
+// (set by --threads; default = every core). Smaller loops stay serial, where fork/join
+// would cost more than the work.
+constexpr size_t kParMin = 256;
+// n <= 0 picks min(cores, kDefaultThreads): measured scaling stops at ~4 threads per party
+// (memory/network bound), and idle OpenMP threads only burn CPU beyond that.
+constexpr int kDefaultThreads = 4;
+inline int set_threads(int n) {
+  ::setenv("OMP_WAIT_POLICY", "passive", 0);  // do not spin between the many short regions
+  const int hw = std::max(1, (int)std::thread::hardware_concurrency());
+  if (n <= 0) n = std::min(hw, kDefaultThreads);
+  omp_set_num_threads(n);
+  return n;
+}
+
+// Allocator whose resize() leaves new elements uninitialised (the MAC logs are written
+// in parallel right after growing; zero-filling them serially would dominate).
+template <class T>
+struct NoInitAlloc : std::allocator<T> {
+  template <class U> struct rebind { using other = NoInitAlloc<U>; };
+  using std::allocator<T>::allocator;
+  template <class U> void construct(U* p) noexcept { ::new ((void*)p) U; }
+  template <class U, class... A> void construct(U* p, A&&... a) { ::new ((void*)p) U(std::forward<A>(a)...); }
+};
+using OpenLog = std::vector<u128, NoInitAlloc<u128>>;
+
 enum class Tamper { NONE, ARITH, BIN };  // TEST ONLY: corrupt one share sent by the client
 
 // ------------------------------------------------------------- online context
@@ -122,10 +151,16 @@ struct OnlineCtx {
 
   // opened values (full ring element) and this party's MAC share on them
   std::vector<u128> arith_open, arith_mac;  // mod 2^(k+s) = 2^128
-  std::vector<u128> bin_open, bin_mac;      // mod 2^(1+s) = 2^65
+  OpenLog bin_open, bin_mac;                // mod 2^(1+s) = 2^65
 
   PhaseStat stat[NCAT];
   uint64_t and_gates = 0, ltz_count = 0;
+
+  // Pre-size the logs so the online phase never reallocates them (outside the timed phase).
+  void reserve_openings(size_t arith, size_t bin) {
+    arith_open.reserve(arith); arith_mac.reserve(arith);
+    bin_open.reserve(bin); bin_mac.reserve(bin);
+  }
 
   OnlineCtx(MdParty& p, u128 beta_shr) : party(p), id((int)p.my_id()), alpha(p.global_key_shr()), beta(beta_shr) {}
 
@@ -142,15 +177,22 @@ struct OnlineCtx {
   // Exchange (1+s) = 65-bit ring elements as one message: n low 64-bit words, then
   // the n top bits packed into bytes.
   std::vector<u128> exchange65(const std::vector<u128>& mine, Cat cat) {
-    const size_t n = mine.size(), lo_bytes = 8 * n;
-    std::vector<uint8_t> msg(lo_bytes + (n + 7) / 8, 0);
+    const size_t n = mine.size(), lo_bytes = 8 * n, hi_bytes = (n + 7) / 8;
+    std::vector<uint8_t> msg(lo_bytes + hi_bytes);
+#pragma omp parallel for schedule(static) if (n >= 16 * kParMin)
     for (size_t i = 0; i < n; ++i) {
       const u64 lo = (u64)mine[i];
       std::memcpy(&msg[8 * i], &lo, 8);
-      msg[lo_bytes + (i >> 3)] |= (uint8_t)(((mine[i] >> 64) & 1) << (i & 7));
+    }
+#pragma omp parallel for schedule(static) if (n >= 16 * kParMin)
+    for (size_t j = 0; j < hi_bytes; ++j) {
+      uint8_t v = 0;
+      for (size_t k = 0; k < 8 && 8 * j + k < n; ++k) v |= (uint8_t)(((mine[8 * j + k] >> 64) & 1) << k);
+      msg[lo_bytes + j] = v;
     }
     const auto th = exchange(msg, cat);
     std::vector<u128> out(n);
+#pragma omp parallel for schedule(static) if (n >= 16 * kParMin)
     for (size_t i = 0; i < n; ++i) {
       u64 lo;
       std::memcpy(&lo, &th[8 * i], 8);
@@ -272,8 +314,19 @@ class MulGate : public GateT {
   }
 
   std::vector<u128> mul(const std::vector<u128>& l, const std::vector<u128>& r) const {
-    if (mode_ == MATMUL) return md_ml::matrixMultiply(l, r, dim_row(), mid_, dim_col());
+    if (mode_ == MATMUL) {  // row-parallel i-k-j product mod 2^128
+      const size_t R = dim_row(), M = mid_, C = dim_col();
+      std::vector<u128> o(R * C, 0);
+#pragma omp parallel for schedule(static) if (R * M * C >= (size_t)1 << 20 && R > 1)
+      for (size_t i = 0; i < R; ++i)
+        for (size_t k = 0; k < M; ++k) {
+          const u128 a = l[i * M + k];
+          for (size_t j = 0; j < C; ++j) o[i * C + j] += a * r[k * C + j];
+        }
+      return o;
+    }
     std::vector<u128> o(l.size());
+#pragma omp parallel for schedule(static) if (l.size() >= kParMin * 16)
     for (size_t i = 0; i < l.size(); ++i) o[i] = l[i] * r[i];
     return o;
   }
@@ -412,6 +465,7 @@ class GeqZeroGate : public GateT {
   std::vector<BShare> and_batch(const std::vector<BShare>& X, const std::vector<BShare>& Y) {
     const size_t n = X.size();
     std::vector<u128> de(2 * n);
+#pragma omp parallel for schedule(static) if (n >= kParMin)
     for (size_t i = 0; i < n; ++i) {
       de[2 * i] = m65(X[i].v - ta_[next_ + i].v);
       de[2 * i + 1] = m65(Y[i].v - tb_[next_ + i].v);
@@ -420,11 +474,15 @@ class GeqZeroGate : public GateT {
     if (!sendv.empty() && ctx_.take_tamper(Tamper::BIN)) sendv[0] = m65(sendv[0] + 1);
     auto theirs = ctx_.exchange65(sendv, C_CMP);
     std::vector<BShare> Z(n);
+    const size_t base = ctx_.bin_open.size();  // openings are logged at fixed offsets: 2 per AND
+    ctx_.bin_open.resize(base + 2 * n);
+    ctx_.bin_mac.resize(base + 2 * n);
+#pragma omp parallel for schedule(static) if (n >= kParMin)
     for (size_t i = 0; i < n; ++i) {
       const BShare &a = ta_[next_ + i], &b = tb_[next_ + i], &c = tc_[next_ + i];
       const u128 d = m65(de[2 * i] + theirs[2 * i]), e = m65(de[2 * i + 1] + theirs[2 * i + 1]);
-      ctx_.bin_open.push_back(d); ctx_.bin_mac.push_back(m65(X[i].m - a.m));
-      ctx_.bin_open.push_back(e); ctx_.bin_mac.push_back(m65(Y[i].m - b.m));
+      ctx_.bin_open[base + 2 * i] = d;      ctx_.bin_mac[base + 2 * i] = m65(X[i].m - a.m);
+      ctx_.bin_open[base + 2 * i + 1] = e;  ctx_.bin_mac[base + 2 * i + 1] = m65(Y[i].m - b.m);
       Z[i].v = m65(c.v + d * b.v + e * a.v + (ctx_.id == 0 ? d * e : 0));
       Z[i].m = m65(c.m + d * b.m + e * a.m + ctx_.beta * d * e);
     }
@@ -443,6 +501,7 @@ class GeqZeroGate : public GateT {
     std::vector<std::vector<BShare>> P(n), G(n);
     std::vector<BShare> Bmsb(n);
     std::vector<unsigned> Amsb(n);
+#pragma omp parallel for schedule(static) if (n >= 8)
     for (size_t e = 0; e < n; ++e) {
       const u64 A = (u64)Dx[e];
       P[e].resize(L); G[e].resize(L);
@@ -460,15 +519,20 @@ class GeqZeroGate : public GateT {
     int len = L;
     while (len > 1) {
       const int pairs = len / 2;
-      std::vector<BShare> X, Y;
-      for (size_t e = 0; e < n; ++e)
-        for (int j = 0; j < pairs; ++j) {
-          X.push_back(P[e][2 * j + 1]); Y.push_back(G[e][2 * j]);      // p_hi * g_lo
-          if (j > 0) { X.push_back(P[e][2 * j + 1]); Y.push_back(P[e][2 * j]); }  // p_hi * p_lo
-        }
-      auto Z = and_batch(X, Y);
-      size_t k = 0;
+      const size_t per = (size_t)(2 * pairs - 1);  // ANDs per element at this level
+      std::vector<BShare> X(n * per), Y(n * per);
+#pragma omp parallel for schedule(static) if (n >= 8)
       for (size_t e = 0; e < n; ++e) {
+        size_t k = e * per;
+        for (int j = 0; j < pairs; ++j) {
+          X[k] = P[e][2 * j + 1]; Y[k++] = G[e][2 * j];      // p_hi * g_lo
+          if (j > 0) { X[k] = P[e][2 * j + 1]; Y[k++] = P[e][2 * j]; }  // p_hi * p_lo
+        }
+      }
+      auto Z = and_batch(X, Y);
+#pragma omp parallel for schedule(static) if (n >= 8)
+      for (size_t e = 0; e < n; ++e) {
+        size_t k = e * per;
         std::vector<BShare> P2(pairs + len % 2), G2(pairs + len % 2);
         for (int j = 0; j < pairs; ++j) {
           G2[j] = add(G[e][2 * j + 1], Z[k++]);
@@ -492,9 +556,13 @@ class GeqZeroGate : public GateT {
     }
     auto vth = ctx_.exchange65(vsh, C_CMP);
     std::vector<u128> D(n), M(n);
+    const size_t bbase = ctx_.bin_open.size();
+    ctx_.bin_open.resize(bbase + n);
+    ctx_.bin_mac.resize(bbase + n);
+#pragma omp parallel for schedule(static) if (n >= kParMin)
     for (size_t e = 0; e < n; ++e) {
       const u128 v = m65(vsh[e] + vth[e]);
-      ctx_.bin_open.push_back(v); ctx_.bin_mac.push_back(vmac[e]);
+      ctx_.bin_open[bbase + e] = v; ctx_.bin_mac[bbase + e] = vmac[e];
       const unsigned vb = (unsigned)(v & 1);
       const u128 zv = (ctx_.id == 0 ? (u128)vb : 0) + (vb ? -ra_v_[e] : ra_v_[e]);
       const u128 zm = ctx_.alpha * vb + (vb ? -ra_m_[e] : ra_m_[e]);
@@ -627,8 +695,16 @@ inline bool mac_check(OnlineCtx& c) {
   const auto r = prg_words(seed, na + nb);
   // 2. y = sum r_i x_i;  z_j = sum r_i m_ij - alpha_j y   (mod 2^(k+s), per domain)
   u128 ya = 0, ma = 0, yb = 0, mb = 0;
-  for (size_t i = 0; i < na; ++i) { ya += (u128)r[i] * c.arith_open[i]; ma += (u128)r[i] * c.arith_mac[i]; }
-  for (size_t i = 0; i < nb; ++i) { yb += (u128)r[na + i] * c.bin_open[i]; mb += (u128)r[na + i] * c.bin_mac[i]; }
+#pragma omp parallel if (na + nb >= 16 * kParMin)
+  {
+    u128 la = 0, lma = 0, lb = 0, lmb = 0;  // per-thread partial sums (mod 2^128)
+#pragma omp for schedule(static) nowait
+    for (size_t i = 0; i < na; ++i) { la += (u128)r[i] * c.arith_open[i]; lma += (u128)r[i] * c.arith_mac[i]; }
+#pragma omp for schedule(static) nowait
+    for (size_t i = 0; i < nb; ++i) { lb += (u128)r[na + i] * c.bin_open[i]; lmb += (u128)r[na + i] * c.bin_mac[i]; }
+#pragma omp critical(lrmd_macsum)
+    { ya += la; ma += lma; yb += lb; mb += lmb; }
+  }
   const u128 za = ma - c.alpha * ya;
   const u128 zb = m65(mb - c.beta * m65(yb));
   // 3. commit to z_j, open, check sum_j z_j == 0

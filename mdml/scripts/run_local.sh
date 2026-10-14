@@ -10,14 +10,16 @@ PORT="${PORT:-$(( (RANDOM % 20000) + 20000 ))}"
 JOB="${JOB:-lr_$$}"
 OFF="${OFFLINE_DIR:-results/offline}"
 mkdir -p results
+# THREADS = OpenMP threads per party (default: all cores; both parties share this machine)
+T=""; [ -n "${THREADS:-}" ] && T="--threads $THREADS"
 V=""; [ "${VERIFY:-1}" = "1" ] && V="--verify"
 build/lr_mdml_dealer --offline-dir "$OFF" --job "$JOB" --json results/last_dealer.json "$@" > results/dealer.log 2>&1 \
   || { cat results/dealer.log; exit 1; }
 cat results/dealer.log
-build/lr_mdml server --port "$PORT" --offline-dir "$OFF" --job "$JOB" $V \
+build/lr_mdml server $T --port "$PORT" --offline-dir "$OFF" --job "$JOB" $V \
   --csv results/results.csv --json results/last_run.json "$@" > results/server.log 2>&1 &
 SPID=$!
-build/lr_mdml client --port "$PORT" --offline-dir "$OFF" --job "$JOB" ${TAMPER:+--tamper "$TAMPER"} "$@" \
+build/lr_mdml client $T --port "$PORT" --offline-dir "$OFF" --job "$JOB" ${TAMPER:+--tamper "$TAMPER"} "$@" \
   > results/client.log 2>&1
 CRC=$?
 wait "$SPID"; SRC=$?
