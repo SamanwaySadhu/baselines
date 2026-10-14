@@ -1,0 +1,41 @@
+diff --git a/src/networking/Party.cpp b/src/networking/Party.cpp
+index 09a4246..4e5b1c3 100644
+--- a/src/networking/Party.cpp
++++ b/src/networking/Party.cpp
+@@ -7,6 +7,7 @@
+ #include <vector>
+ #include <cstddef>
+ #include <mutex>
++#include <cstdlib>
+ 
+ #include <boost/asio.hpp>
+ 
+@@ -29,7 +30,10 @@ Party::Party(std::size_t p_my_id, std::size_t p_num_parties, std::size_t p_port)
+         receive_sockets_.emplace_back(io_context_);
+         timers_.emplace_back(io_context_);
+ 
+-        send_endpoints_.emplace_back(boost::asio::ip::make_address("127.0.0.1"), WhichPort(my_id_, other_id));
++        // Peer address: MDML_PEER_HOST (default 127.0.0.1), so the two parties can run on two machines.
++        const char* peer_host = std::getenv("MDML_PEER_HOST");
++        send_endpoints_.emplace_back(boost::asio::ip::make_address(peer_host && *peer_host ? peer_host : "127.0.0.1"),
++                                     WhichPort(my_id_, other_id));
+ 
+         // receive_endpoint is used only once and is not stored
+         boost::asio::ip::tcp::endpoint receive_endpoint(boost::asio::ip::tcp::v4(), WhichPort(other_id, my_id_));
+@@ -54,6 +58,16 @@ Party::Party(std::size_t p_my_id, std::size_t p_num_parties, std::size_t p_port)
+ 
+     io_context_.run();
+ 
++    // Disable Nagle's algorithm: the online phase exchanges many small messages, and
++    // Nagle + delayed ACKs would add ~40 ms stalls (emp-tool's NetIO does the same).
++    for (std::size_t other_id = 0; other_id < num_parties_; ++other_id) {
++        if (other_id == my_id_) {
++            continue;
++        }
++        send_sockets_[other_id].set_option(boost::asio::ip::tcp::no_delay(true));
++        receive_sockets_[other_id].set_option(boost::asio::ip::tcp::no_delay(true));
++    }
++
+     // These can be safely deleted
+     send_endpoints_.clear();
+     send_endpoints_.shrink_to_fit();
