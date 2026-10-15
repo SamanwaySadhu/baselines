@@ -32,7 +32,7 @@ target_compile_options(cryptonn_common INTERFACE -Wall -Wextra
 add_executable(lr_cryptonn src/lr_cryptonn.cpp)
 target_link_libraries(lr_cryptonn PRIVATE cryptonn_common)
 
-# Offline tests of the group wrapper, BSGS, FEIP, FEBO and the fixed-point protocol
-# arithmetic (no networking).
+# Tests of the group wrapper, BSGS, FEIP, FEBO, and end-to-end runs of the real
+# client / server protocol code (include/cryptonn_protocol.h) over loopback TCP.
 add_executable(lr_cryptonn_selftest src/lr_cryptonn_selftest.cpp)
 target_link_libraries(lr_cryptonn_selftest PRIVATE cryptonn_common)

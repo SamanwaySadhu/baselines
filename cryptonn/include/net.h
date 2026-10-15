@@ -2,6 +2,8 @@
 // with exact payload byte counters and flight counting.
 //
 //   auto ch = Channel::listen(port);              // server: accept ONE connection
+//   Channel::listen(0, "127.0.0.1", [](int p) {...}) // ephemeral port; the callback
+//                                                  // gets the bound port before accept
 //   auto ch = Channel::connect("127.0.0.1", port); // client: retries for ~10 s, so it
 //                                                  // may start right after the server
 //
@@ -34,6 +36,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <stdexcept>
@@ -58,9 +61,11 @@ class Channel {
   static constexpr size_t kBufBytes = 1 << 16;
 
   // Server side: bind (SO_REUSEADDR) to bind_host:port, accept one connection, close
-  // the listening socket.
-  static std::unique_ptr<Channel> listen(int port, const std::string& bind_host = "0.0.0.0") {
-    check_port(port);
+  // the listening socket. port = 0 binds an ephemeral port; on_listening (if set) is
+  // called with the bound port once the socket listens, before accept() blocks.
+  static std::unique_ptr<Channel> listen(int port, const std::string& bind_host = "0.0.0.0",
+                                         const std::function<void(int)>& on_listening = {}) {
+    if (port < 0 || port > 65535) throw std::invalid_argument("net: bad port " + std::to_string(port));
     const int ls = ::socket(AF_INET, SOCK_STREAM, 0);
     if (ls < 0) sys_fail("socket");
     const int one = 1;
@@ -81,6 +86,21 @@ class Channel {
       const int e = errno;
       ::close(ls);
       sys_fail("listen", e);
+    }
+    if (on_listening) {
+      sockaddr_in b{};
+      socklen_t blen = sizeof b;
+      if (::getsockname(ls, (sockaddr*)&b, &blen) < 0) {
+        const int e = errno;
+        ::close(ls);
+        sys_fail("getsockname", e);
+      }
+      try {
+        on_listening((int)ntohs(b.sin_port));
+      } catch (...) {
+        ::close(ls);
+        throw;
+      }
     }
     int fd;
     do { fd = ::accept(ls, nullptr, nullptr); } while (fd < 0 && errno == EINTR);

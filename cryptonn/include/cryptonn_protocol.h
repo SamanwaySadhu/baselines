@@ -1,46 +1,65 @@
-// cryptonn_protocol.h -- the CryptoNN logistic-regression protocol (Xu, Joshi, Li,
-// "CryptoNN: Training Neural Networks over Encrypted Data", ICDCS 2019), as message-level
-// state machines for the two parties. lr_cryptonn.cpp drives them over TCP and
-// lr_cryptonn_selftest.cpp in-process, so both run exactly this code.
+// cryptonn_protocol.h -- the two-party CryptoNN logistic-regression protocol (client and
+// server code), shared by lr_cryptonn (the program) and lr_cryptonn_selftest (which runs
+// both parties in two threads over loopback TCP).
 //
-//   CLIENT (CnClient) = data owner AND the paper's trusted authority: holds the data
-//                       (x, y), the initial weights w0 and every master secret key, and
-//                       derives function keys when the server asks for them.
-//   SERVER (CnServer) = model holder: keeps w in the clear and runs the paper's
-//                       Algorithm 2, using FE only for the steps that touch the data.
+// CryptoNN (Xu, Joshi, Li, ICDCS 2019) trains a model held IN THE CLEAR by a server on
+// data that the data owners only ever send functionally encrypted. A trusted authority
+// holds the master secret keys and hands the server function keys for the vectors the
+// training needs. Here the authority is merged into the client, the data owner:
 //
-// Fixed-point training of lr_reference.h, per iteration t (batch i < B, f = qbits-1,
-// MAXQ = 2^f - 1, K = batch/lr = 2^k):
-//   zfull_i = <w_data, x_i>  [FEIP fwd]  + w_bias*MAXQ  [public bias column, plaintext]
-//   z_i = zfull_i >> f;  yhat_i = qsigmoid_ref(z_i, f)   [plaintext at the server]
-//   e_i = yhat_i - MAXQ*y_i  [FEBO '-': decrypts to MAXQ*y_i - yhat_i, the server negates]
-//   gfull_j = <e, (x_0j..x_{B-1}j)>  [FEIP bwd], j < d_data;  gfull_bias = MAXQ*sum_i e_i
-//   w_j <- (K*w_j - (gfull_j >> f)) / K   (C++ '/': toward zero)
-// so the result equals reference_train bit for bit. With --no-bias every one of the d
-// columns is client data (d_data = d) and there are no plaintext bias terms.
+//   CLIENT = data owner + FE authority: owns the training data (x, y), the initial
+//            weights w0 and every master secret key (msk_ff, msk_bp, msk_bo).
+//   SERVER = model trainer: receives ciphertexts only, holds the model w in the clear,
+//            requests function keys and decrypts the inner products / differences.
 //
-// Offline upload (ONE client->server flight), layout from upload_layout():
-//   header (32 B: magic "CNN1", d, iters, batch, qbits, flags, lr as IEEE bits)
-//   w0       d x int32 LE                        (CryptoNN's server needs w in the clear)
-//   FEIP fwd iters*B ciphertexts of x_i (eta = d_data), (d_data+1)*33 B each
-//   FEIP bwd iters*d_data ciphertexts of column j of batch t (eta = B), (B+1)*33 B each
-//   FEBO     iters*B ciphertexts (cmt, ct) of MAXQ*y_i, 66 B each
-// The three key sets (FEIP fwd, FEIP bwd, FEBO) are independent. mpk is not sent:
-// decryption does not use it, and the client both encrypts and derives keys.
+// Notation: f = qbits - 1, MAXQ = 2^f - 1, K = batch / lr = 2^k_shift; batch t holds the
+// rows i < batch of the Dataset (lr_params.h); the label value is MAXQ * y.
 //
-// Online, per iteration (3 round trips):
-//   R1 S->C w_0..w_{d_data-1} (int32)  | C->S sk_w = <w, s_fwd> mod q        (32 B)
-//   R2 S->C yhat_0..yhat_{B-1} (int32) | C->S B FEBO '-' keys                (33 B each)
-//   R3 S->C e_0..e_{B-1} (int32)       | C->S sk_e = <e, s_bwd> mod q        (32 B)
+// PREPROCESSING (paper Algorithm 1, pre-process-encryption)
+//   0. handshake: client -> server the public parameters (kHeaderBytes, NOT the seed);
+//      server -> client one status byte (0 = the server's parameters are identical).
+//   1. client: FEIP.Setup(eta = d) (msk_ff, for sample rows), FEIP.Setup(eta = batch)
+//      (msk_bp, for the per-batch feature columns), FEBO.Setup (msk_bo, for labels), and
+//      encryption with the PUBLIC keys, as a data owner would (--enc-with-msk: the
+//      authority's equivalent shortcut feip::encrypt_with_msk):
+//        ct_ff[t][i] = FEIP_ff.Enc(x_{t,i,:})     d components
+//        ct_bp[t][j] = FEIP_bp.Enc(x_{t,:,j})     batch components
+//        ct_bo[t][i] = FEBO.Enc(MAXQ * y_{t,i})
+//      All ciphertexts and w0 (d int32) go to the server in ONE flight. Revealing w0 is
+//      inherent to CryptoNN: the server holds the model in plaintext, because it asks for
+//      function keys for w and FEIP decryption takes y = w as input. mpk is not sent (the
+//      server never encrypts and decryption does not use it).
+//   2. server: BSGS table (input independent, overlaps the client's encryption), receive
+//      and deserialize (validates every point) the ciphertexts.
 //
-// Every decryption ends in a bounded discrete log with an EXACT bound (|x| <= 2^f):
-//   forward  2^f * sum_j |w_j|,   FEBO  2*MAXQ,   backward  2^f * sum_i |e_i|
-// so a solve can only fail if the protocol is broken; a failure throws DlogError (it is
-// never silently replaced by a wrong value). set_test_bound_cap() shrinks the bounds to
-// demonstrate this (tests only).
+// ONLINE, iteration t (paper Algorithm 2, LR case): 3 round trips
+//   a. secure feed-forward:  s -> c  w (d int32);   c -> s  sk_w = FEIP.KeyDerive(msk_ff, w)
+//      server: zfull_i = dlog(FEIP.Dec(ct_ff[t][i], sk_w, w)), |zfull_i| <= sum_j |w_j| 2^f;
+//              z_i = trunc_f(zfull_i), yhat_i = qsigmoid_ref(z_i)
+//   b. secure evaluation:    s -> c  yhat (batch int32);
+//                            c -> s  per i FEBO.KeyDerive(msk_bo, cmt_{t,i}, '-', yhat_i)
+//      server: d_i = dlog(FEBO.Dec) = MAXQ y_i - yhat_i (|d_i| <= MAXQ); e_i = -d_i
+//   c. secure back-propagation: s -> c  e (batch int32); c -> s  sk_e = FEIP.KeyDerive(msk_bp, e)
+//      server: gfull_j = dlog(FEIP.Dec(ct_bp[t][j], sk_e, e)), |gfull_j| <= sum_i |e_i| 2^f;
+//              g_j = trunc_f(gfull_j);  w_j = (K w_j - g_j) / K (C++ '/')
+//   This is exactly reference_train (lr_reference.h), bit for bit. The client keeps the
+//   FEBO commitments cmt_{t,i} it generated, so a key request carries only yhat (in the
+//   paper the server sends cmt along with the request).
+// OUTPUT: the server ends holding the trained model. With --send-model it also sends w to
+//   the client (s -> c, 4d bytes), counted in a separate 'output' stage.
 //
-// Threads: encryption (client) and decryption + dlog (server) are split over --threads
-// std::threads by index; every result is independent of the thread count.
+// What each party learns (semi-honest): the server learns w0 and every w, z, yhat, e, g,
+// and hence every label (y = (yhat - e) / MAXQ) -- inherent to CryptoNN's LR (the paper's
+// random label mapping is for one-hot multi-class labels and is not applied to binary
+// labels). The client, being the authority, learns every w, yhat and e it is asked to
+// key. A malicious server could request keys for unit vectors and read features
+// directly; the authority's range checks below do not prevent that (as in the paper).
+//
+// Cost accounting (metrics.h): each party records contiguous phases named
+// "<stage>/<sub-phase>" with stage in {pre, online, output}; sub-phases whose name starts
+// with "wait" are blocking receives (waiting for the peer), the rest is local compute
+// plus sends. Every flight is flushed explicitly where it ends so that its send cost is
+// attributed to the phase that produced it.
 #ifndef LRCN_CRYPTONN_PROTOCOL_H
 #define LRCN_CRYPTONN_PROTOCOL_H
 
@@ -51,446 +70,678 @@
 #include "lr_params.h"
 #include "lr_reference.h"
 #include "metrics.h"
+#include "net.h"
 
 #include <algorithm>
-#include <cmath>
+#include <array>
+#include <atomic>
+#include <condition_variable>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <exception>
-#include <limits>
+#include <functional>
+#include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
-#include <tuple>
+#include <utility>
 #include <vector>
 
 namespace lrcn {
 
-// ------------------------------------------------------------- wire layout
-constexpr uint32_t kUploadMagic = 0x314E4E43u;  // "CNN1" little-endian
-constexpr size_t kHeaderBytes = 32;
+// ---------------------------------------------------------------- worker pool
+// Persistent helper threads for parallel_for (the caller participates; dynamic
+// scheduling by an atomic index). Keeps thread creation out of the timed phases and
+// gives each thread a long-lived BN_CTX. threads = 1: everything runs inline.
+class WorkerPool {
+ public:
+  explicit WorkerPool(int threads) {
+    const int helpers = std::max(1, threads) - 1;
+    for (int k = 0; k < helpers; ++k) th_.emplace_back([this] { loop(); });
+  }
+  ~WorkerPool() {
+    {
+      std::lock_guard<std::mutex> g(mu_);
+      stop_ = true;
+    }
+    cv_.notify_all();
+    for (auto& t : th_) t.join();
+  }
+  WorkerPool(const WorkerPool&) = delete;
+  WorkerPool& operator=(const WorkerPool&) = delete;
 
-struct UploadLayout {
-  size_t header = 0, w0 = 0, fwd = 0, bwd = 0, febo = 0, total = 0;  // section sizes
-  size_t off_w0 = 0, off_fwd = 0, off_bwd = 0, off_febo = 0;         // section offsets
-  size_t fwd_ct = 0, bwd_ct = 0, febo_ct = 0;                        // one ciphertext
+  int threads() const { return int(th_.size()) + 1; }
+
+  // fn(i) for every i in [0, n); rethrows the first exception (remaining indices skipped).
+  template <class F>
+  void parallel_for(size_t n, F&& fn) {
+    if (n == 0) return;
+    if (th_.empty() || n == 1) {
+      for (size_t i = 0; i < n; ++i) fn(i);
+      return;
+    }
+    const std::function<void(size_t)> job = [&fn](size_t i) { fn(i); };
+    {
+      std::lock_guard<std::mutex> g(mu_);
+      job_ = &job;
+      n_ = n;
+      next_.store(0);
+      err_ = nullptr;
+      pending_ = th_.size();
+      ++gen_;
+    }
+    cv_.notify_all();
+    run_job();
+    std::unique_lock<std::mutex> lk(mu_);
+    done_cv_.wait(lk, [this] { return pending_ == 0; });
+    job_ = nullptr;
+    if (err_) {
+      std::exception_ptr e = err_;
+      err_ = nullptr;
+      std::rethrow_exception(e);
+    }
+  }
+
+ private:
+  void run_job() {
+    for (;;) {
+      const size_t i = next_.fetch_add(1);
+      if (i >= n_) return;
+      try {
+        (*job_)(i);
+      } catch (...) {
+        std::lock_guard<std::mutex> g(mu_);
+        if (!err_) err_ = std::current_exception();
+        next_.store(n_);
+      }
+    }
+  }
+  void loop() {
+    uint64_t seen = 0;
+    for (;;) {
+      {
+        std::unique_lock<std::mutex> lk(mu_);
+        cv_.wait(lk, [&] { return stop_ || gen_ != seen; });
+        if (stop_) return;
+        seen = gen_;
+      }
+      run_job();
+      std::lock_guard<std::mutex> g(mu_);
+      if (--pending_ == 0) done_cv_.notify_one();
+    }
+  }
+
+  std::mutex mu_;
+  std::condition_variable cv_, done_cv_;
+  const std::function<void(size_t)>* job_ = nullptr;
+  size_t n_ = 0;
+  std::atomic<size_t> next_{0};
+  size_t pending_ = 0;
+  uint64_t gen_ = 0;
+  bool stop_ = false;
+  std::exception_ptr err_;
+  std::vector<std::thread> th_;
 };
 
-inline UploadLayout upload_layout(const Params& P) {
-  UploadLayout L;
-  L.fwd_ct = feip::ct_bytes(P.d_data);
-  L.bwd_ct = feip::ct_bytes(P.batch);
-  L.febo_ct = febo::kCtBytes;
-  L.header = kHeaderBytes;
-  L.w0 = 4 * (size_t)P.d;
-  L.fwd = (size_t)P.iters * P.batch * L.fwd_ct;
-  L.bwd = (size_t)P.iters * P.d_data * L.bwd_ct;
-  L.febo = (size_t)P.iters * P.batch * L.febo_ct;
-  L.off_w0 = L.header;
-  L.off_fwd = L.off_w0 + L.w0;
-  L.off_bwd = L.off_fwd + L.fwd;
-  L.off_febo = L.off_bwd + L.bwd;
-  L.total = L.off_febo + L.febo;
-  return L;
-}
-// Online payload per iteration (both directions).
-inline size_t online_s2c_per_iter(const Params& P) { return 4 * ((size_t)P.d_data + 2 * (size_t)P.batch); }
-inline size_t online_c2s_per_iter(const Params& P) {
-  return kScalarBytes + febo::kKeyBytes * (size_t)P.batch + kScalarBytes;
-}
+// ------------------------------------------------------------------ options
+struct ProtoOptions {
+  Params P;                   // finalized; both parties must agree (checked by the handshake)
+  int threads = 1;            // per party: encryption / (de)serialization / decryption + dlog
+  bool enc_with_msk = false;  // client: authority shortcut feip::encrypt_with_msk (same distribution)
+  int dlog_bits = 0;          // server: BSGS table bits; 0 = auto_dlog_bits(P)
+  bool send_model = false;    // both: output stage, the server sends the trained w to the client
+  bool quiet = false;         // no per-iteration progress lines
+};
 
-inline void put_u32(uint8_t* p, uint32_t v) { for (int i = 0; i < 4; ++i) p[i] = (uint8_t)(v >> (8 * i)); }
+// ------------------------------------------------------- public-params header
+// magic "CRNN" | version u32 | d | iters | batch | qbits | k_shift (u32 each) |
+// lr (IEEE double bits, u64) | flags u32 (bit 0: bias column, bit 1: send_model).
+// The seed and --zero-init are the client's private choices and are not sent.
+constexpr size_t kHeaderBytes = 40;
+constexpr uint32_t kProtoVersion = 1;
+
+struct Header {
+  bool magic_ok = false;
+  uint32_t version = 0, d = 0, iters = 0, batch = 0, qbits = 0, k_shift = 0, flags = 0;
+  double lr = 0;
+  std::string str() const {
+    char b[256];
+    std::snprintf(b, sizeof b, "d=%u iters=%u batch=%u qbits=%u lr=%g (k_shift=%u) bias=%s send_model=%s%s",
+                  d, iters, batch, qbits, lr, k_shift, (flags & 1) ? "yes" : "no", (flags & 2) ? "yes" : "no",
+                  magic_ok && version == kProtoVersion ? "" : " [bad magic/version]");
+    return b;
+  }
+};
+
+namespace detail {
+inline void put_u32(uint8_t* p, uint32_t v) {
+  for (int i = 0; i < 4; ++i) p[i] = uint8_t(v >> (8 * i));
+}
 inline uint32_t get_u32(const uint8_t* p) {
   uint32_t v = 0;
-  for (int i = 0; i < 4; ++i) v |= (uint32_t)p[i] << (8 * i);
+  for (int i = 0; i < 4; ++i) v |= uint32_t(p[i]) << (8 * i);
   return v;
 }
-inline void put_u64(uint8_t* p, uint64_t v) { for (int i = 0; i < 8; ++i) p[i] = (uint8_t)(v >> (8 * i)); }
-inline uint64_t get_u64(const uint8_t* p) {
-  uint64_t v = 0;
-  for (int i = 0; i < 8; ++i) v |= (uint64_t)p[i] << (8 * i);
-  return v;
+inline void put_i32(uint8_t* p, int64_t v, const char* what) {
+  if (v < INT32_MIN || v > INT32_MAX)
+    throw std::runtime_error(std::string(what) + ": value " + std::to_string(v) + " does not fit in int32");
+  put_u32(p, uint32_t(int32_t(v)));
 }
-inline void put_i32(uint8_t* p, int64_t v) {
-  if (v < std::numeric_limits<int32_t>::min() || v > std::numeric_limits<int32_t>::max())
-    throw std::runtime_error("value " + std::to_string(v) + " does not fit in int32");
-  put_u32(p, (uint32_t)(int32_t)v);
-}
-inline int64_t get_i32(const uint8_t* p) { return (int32_t)get_u32(p); }
+inline int64_t get_i32(const uint8_t* p) { return int32_t(get_u32(p)); }
+}  // namespace detail
 
-// The public training parameters, so the two parties can check that they agree.
-inline void encode_header(const Params& P, uint8_t* h) {
+inline std::array<uint8_t, kHeaderBytes> encode_header(const Params& P, bool send_model) {
+  std::array<uint8_t, kHeaderBytes> h{};
+  std::memcpy(h.data(), "CRNN", 4);
+  detail::put_u32(&h[4], kProtoVersion);
+  detail::put_u32(&h[8], uint32_t(P.d));
+  detail::put_u32(&h[12], uint32_t(P.iters));
+  detail::put_u32(&h[16], uint32_t(P.batch));
+  detail::put_u32(&h[20], uint32_t(P.qbits));
+  detail::put_u32(&h[24], uint32_t(P.k_shift));
   uint64_t lr_bits;
   std::memcpy(&lr_bits, &P.lr, 8);
-  put_u32(h + 0, kUploadMagic);
-  put_u32(h + 4, (uint32_t)P.d);
-  put_u32(h + 8, (uint32_t)P.iters);
-  put_u32(h + 12, (uint32_t)P.batch);
-  put_u32(h + 16, (uint32_t)P.qbits);
-  put_u32(h + 20, P.bias ? 1u : 0u);
-  put_u64(h + 24, lr_bits);
+  detail::put_u32(&h[28], uint32_t(lr_bits));
+  detail::put_u32(&h[32], uint32_t(lr_bits >> 32));
+  detail::put_u32(&h[36], (P.bias ? 1u : 0u) | (send_model ? 2u : 0u));
+  return h;
 }
-// Throws std::runtime_error naming every field that differs from P.
-inline void check_header(const uint8_t* h, const Params& P) {
-  if (get_u32(h) != kUploadMagic) throw std::runtime_error("upload header: bad magic (not a CryptoNN client?)");
-  double lr;
-  const uint64_t lr_bits = get_u64(h + 24);
-  std::memcpy(&lr, &lr_bits, 8);
-  std::string diff;
-  auto cmp = [&](const char* name, long long theirs, long long mine) {
-    if (theirs != mine) diff += std::string(" ") + name + "=" + std::to_string(theirs) + " (here " + std::to_string(mine) + ")";
-  };
-  cmp("--d", get_u32(h + 4), P.d);
-  cmp("--iters", get_u32(h + 8), P.iters);
-  cmp("--batch", get_u32(h + 12), P.batch);
-  cmp("--qbits", get_u32(h + 16), P.qbits);
-  cmp("bias", get_u32(h + 20), P.bias ? 1 : 0);
-  if (lr != P.lr) diff += " --lr=" + std::to_string(lr) + " (here " + std::to_string(P.lr) + ")";
-  if (!diff.empty()) throw std::runtime_error("the client's training parameters differ:" + diff);
+inline Header decode_header(const uint8_t* h) {
+  Header r;
+  r.magic_ok = std::memcmp(h, "CRNN", 4) == 0;
+  r.version = detail::get_u32(h + 4);
+  r.d = detail::get_u32(h + 8);
+  r.iters = detail::get_u32(h + 12);
+  r.batch = detail::get_u32(h + 16);
+  r.qbits = detail::get_u32(h + 20);
+  r.k_shift = detail::get_u32(h + 24);
+  const uint64_t lr_bits = uint64_t(detail::get_u32(h + 28)) | (uint64_t(detail::get_u32(h + 32)) << 32);
+  std::memcpy(&r.lr, &lr_bits, 8);
+  r.flags = detail::get_u32(h + 36);
+  return r;
 }
 
-// ------------------------------------------------------------- threading
-// f(i) for i in [0, n), split into contiguous blocks over `threads` std::threads; the
-// first exception (by block) is rethrown after all threads have joined.
-template <class F>
-void parallel_for(int threads, size_t n, F&& f) {
-  if (threads <= 1 || n <= 1) {
-    for (size_t i = 0; i < n; ++i) f(i);
-    return;
-  }
-  const size_t T = std::min<size_t>((size_t)threads, n);
-  std::vector<std::thread> th;
-  std::vector<std::exception_ptr> err(T);
-  th.reserve(T);
-  for (size_t k = 0; k < T; ++k)
-    th.emplace_back([&, k] {
-      try {
-        for (size_t i = n * k / T; i < n * (k + 1) / T; ++i) f(i);
-      } catch (...) {
-        err[k] = std::current_exception();
-      }
-    });
-  for (auto& t : th) t.join();
-  for (auto& e : err)
-    if (e) std::rethrow_exception(e);
-}
-
-// A bounded discrete log found no value: the protocol is broken (or a test shrank the
-// bound). Never ignored.
-struct DlogError : std::runtime_error {
-  using std::runtime_error::runtime_error;
+// ------------------------------------------------------ closed-form traffic
+// Exact payload bytes / flights of a run, from the message formats (the selftest
+// asserts measured == expected; the program warns on a mismatch).
+struct CommFormula {
+  uint64_t header = kHeaderBytes, ack = 1;
+  uint64_t upload_ff = 0, upload_bp = 0, upload_bo = 0, upload_w0 = 0, upload = 0;
+  uint64_t iter_c2s = 0, iter_s2c = 0;  // per online iteration
+  uint64_t pre_c2s = 0, pre_s2c = 0, online_c2s = 0, online_s2c = 0, output_s2c = 0;
+  uint64_t pre_flights = 3, online_flights = 0, output_flights = 0;
+  uint64_t c2s() const { return pre_c2s + online_c2s; }
+  uint64_t s2c() const { return pre_s2c + online_s2c + output_s2c; }
+  uint64_t total() const { return c2s() + s2c(); }
+  uint64_t flights() const { return pre_flights + online_flights + output_flights; }
 };
 
-// Rejects parameter combinations this baseline does not support.
-inline void check_protocol_params(const Params& P) {
-  if (P.d_data < 1)
-    throw std::invalid_argument("CryptoNN needs at least one client feature column (--d >= 2 with the bias column)");
+inline CommFormula comm_formula(const Params& P, bool send_model) {
+  CommFormula c;
+  const uint64_t T = uint64_t(P.iters), B = uint64_t(P.batch), d = uint64_t(P.d);
+  c.upload_ff = T * B * feip::ct_bytes(P.d);       // iters*batch*(d+1)*33
+  c.upload_bp = T * d * feip::ct_bytes(P.batch);   // iters*d*(batch+1)*33
+  c.upload_bo = T * B * febo::kCtBytes;            // iters*batch*66
+  c.upload_w0 = 4 * d;
+  c.upload = c.upload_ff + c.upload_bp + c.upload_bo + c.upload_w0;
+  c.pre_c2s = c.header + c.upload;
+  c.pre_s2c = c.ack;
+  c.iter_s2c = 4 * d + 4 * B + 4 * B;                                   // w, yhat, e
+  c.iter_c2s = kScalarBytes + B * febo::kKeyBytes + kScalarBytes;       // sk_w, sk_bo[i], sk_e
+  c.online_c2s = T * c.iter_c2s;
+  c.online_s2c = T * c.iter_s2c;
+  c.online_flights = 6 * T;
+  c.output_s2c = send_model ? 4 * d : 0;
+  c.output_flights = send_model ? 1 : 0;
+  return c;
 }
 
-// ============================================================= the client
-class CnClient {
- public:
-  // enc_with_msk: encrypt with the master secret key (ct_i = (r*s_i + x_i)*g, one
-  // fixed-base multiplication per component). Same ciphertext distribution as the
-  // paper's public-key encryption (ct_i = x_i*g + r*h_i); available because the client
-  // is also the authority. Default: public key, as in the paper.
-  CnClient(const Params& P, Dataset D, std::vector<int64_t> w0, int threads, bool enc_with_msk = false)
-      : P_(P), D_(std::move(D)), w0_(std::move(w0)), threads_(std::max(1, threads)), msk_enc_(enc_with_msk) {
-    check_protocol_params(P_);
-    if ((int)w0_.size() != P_.d) throw std::invalid_argument("CnClient: |w0| != d");
+// ------------------------------------------------------------ public bounds
+// |w_j| before iteration t (0-based): |w0_j| <= 2^f and |g_j| <= batch*MAXQ, so one
+// update moves a weight by at most floor(batch*MAXQ / K). Both parties check the
+// weights against it (the client as authority before it derives a key for w).
+inline int64_t weight_bound(const Params& P, int t) {
+  const int64_t K = int64_t(1) << P.k_shift;
+  return (int64_t(1) << P.f) + int64_t(t) * ((int64_t(P.batch) * P.maxq) / K);
+}
+// BSGS table bits covering max(d, batch) * 2^(2f) in one lookup, capped at 22 bits
+// (4M entries, ~96 MiB); larger values are found by giant steps.
+inline int auto_dlog_bits(const Params& P) {
+  const int64_t bound = int64_t(std::max(P.d, P.batch)) << (2 * P.f);
+  return Dlog::bits_for_bound(bound, 8, 22);
+}
+
+// ------------------------------------------------------------ party report
+// One party's measurements, exchanged at the end (the report exchange itself is not
+// counted anywhere).
+struct PartyReport {
+  std::vector<std::pair<std::string, PhaseStat>> phases;  // "<stage>/<sub-phase>", first-seen order
+  std::vector<double> iter_wall_s;                        // per online iteration
+  double peak_rss_mib = 0;
+  NetCounters net;  // channel counters at the end of the protocol
+  uint64_t threads = 0;       // --threads of that party
+  uint64_t enc_with_msk = 0;  // client: 1 if --enc-with-msk
+
+  static bool is_wait(const std::string& name) {
+    const size_t s = name.find('/');
+    return name.compare(s == std::string::npos ? 0 : s + 1, 4, "wait") == 0;
+  }
+  static bool in_stage(const std::string& name, const std::string& stage) {
+    return stage.empty() || name.compare(0, stage.size() + 1, stage + "/") == 0;
+  }
+  // Sum of the stage's phases ("" = all); compute_only drops the wait phases.
+  PhaseStat stage(const std::string& st, bool compute_only = false) const {
+    PhaseStat s;
+    for (const auto& [n, p] : phases)
+      if (in_stage(n, st) && !(compute_only && is_wait(n))) s.add(p);
+    return s;
   }
 
-  // Setup of the three independent key sets (FEIP fwd: eta = d_data; FEIP bwd: eta = B; FEBO).
-  void keygen() {
-    std::tie(fwd_mpk_, fwd_msk_) = feip::setup(P_.d_data);
-    std::tie(bwd_mpk_, bwd_msk_) = feip::setup(P_.batch);
-    std::tie(bo_mpk_, bo_msk_) = febo::setup();
-    have_keys_ = true;
-  }
-
-  // Encrypts the whole training set into the upload buffer (see the file comment).
-  void encrypt() {
-    if (!have_keys_) throw std::logic_error("CnClient::encrypt before keygen");
-    const UploadLayout L = upload_layout(P_);
-    upload_.assign(L.total, 0);
-    encode_header(P_, upload_.data());
-    for (int j = 0; j < P_.d; ++j) put_i32(upload_.data() + L.off_w0 + 4 * (size_t)j, w0_[(size_t)j]);
-    const size_t n_fwd = (size_t)P_.iters * P_.batch, n_bwd = (size_t)P_.iters * P_.d_data, n_bo = n_fwd;
-    cmt_.assign(n_bo, Point());
-    // One flat index space so that the threads share the work evenly.
-    parallel_for(threads_, n_fwd + n_bwd + n_bo, [&](size_t k) {
-      if (k < n_fwd) {  // x_i of batch t (data columns only)
-        const int t = (int)(k / P_.batch), i = (int)(k % P_.batch);
-        std::vector<int64_t> x((size_t)P_.d_data);
-        for (int j = 0; j < P_.d_data; ++j) x[(size_t)j] = D_.X(t, i, j);
-        const feip::Ct c = msk_enc_ ? feip::encrypt_with_msk(fwd_msk_, x) : feip::encrypt(fwd_mpk_, x);
-        feip::serialize(c, upload_.data() + L.off_fwd + k * L.fwd_ct);
-      } else if (k < n_fwd + n_bwd) {  // column j of batch t
-        const size_t kk = k - n_fwd;
-        const int t = (int)(kk / P_.d_data), j = (int)(kk % P_.d_data);
-        std::vector<int64_t> col((size_t)P_.batch);
-        for (int i = 0; i < P_.batch; ++i) col[(size_t)i] = D_.X(t, i, j);
-        const feip::Ct c = msk_enc_ ? feip::encrypt_with_msk(bwd_msk_, col) : feip::encrypt(bwd_mpk_, col);
-        feip::serialize(c, upload_.data() + L.off_bwd + kk * L.bwd_ct);
-      } else {  // label value MAXQ*y of sample (t, i)
-        const size_t kk = k - n_fwd - n_bwd;
-        const int t = (int)(kk / P_.batch), i = (int)(kk % P_.batch);
-        const int64_t lab = P_.maxq * D_.Y(t, i);
-        febo::Ct c;
-        if (msk_enc_) {
-          const Scalar r = Scalar::random();
-          c.cmt = Point::gen_mul(r);
-          c.ct = Point::gen_mul(r.mul(bo_msk_.s).add(Scalar::from_i64(lab)));  // r*h + lab*g
-        } else {
-          c = febo::encrypt(bo_mpk_, lab);
-        }
-        febo::serialize(c, upload_.data() + L.off_febo + kk * L.febo_ct);
-        cmt_[kk] = c.cmt;  // kept to answer the FEBO key request of R2
-      }
-    });
-  }
-  const std::vector<uint8_t>& upload() const { return upload_; }
-
-  // R1: sk_w = <w_data, s_fwd> mod q (32 bytes into out).
-  void fwd_key(const std::vector<int64_t>& w_data, uint8_t* out) {
-    expect(0, "forward key");
-    if ((int)w_data.size() != P_.d_data) throw std::runtime_error("forward key request: wrong length");
-    feip::serialize_key(feip::key_derive(fwd_msk_, w_data), out);
-    stage_ = 1;
-  }
-  // R2: one FEBO '-' key per sample of batch t for y = yhat_i (B * 33 bytes into out).
-  void eval_keys(const std::vector<int64_t>& yhat, uint8_t* out) {
-    expect(1, "FEBO keys");
-    if ((int)yhat.size() != P_.batch) throw std::runtime_error("FEBO key request: wrong length");
-    for (int i = 0; i < P_.batch; ++i) {
-      if (yhat[(size_t)i] < 0 || yhat[(size_t)i] > P_.maxq)
-        throw std::runtime_error("FEBO key request: yhat outside [0, MAXQ]");
-      const Point& cmt = cmt_[(size_t)t_ * P_.batch + i];
-      febo::serialize_key(febo::key_derive(bo_msk_, cmt, febo::Op::Sub, yhat[(size_t)i]),
-                          out + (size_t)i * febo::kKeyBytes);
+  std::vector<uint8_t> serialize() const {
+    std::vector<uint8_t> b;
+    auto u64 = [&](uint64_t v) {
+      for (int i = 0; i < 8; ++i) b.push_back(uint8_t(v >> (8 * i)));
+    };
+    auto dbl = [&](double v) {
+      uint64_t u;
+      std::memcpy(&u, &v, 8);
+      u64(u);
+    };
+    u64(phases.size());
+    for (const auto& [n, p] : phases) {
+      u64(n.size());
+      b.insert(b.end(), n.begin(), n.end());
+      dbl(p.wall_s); dbl(p.cpu_s);
+      u64(p.sent); u64(p.recv); u64(p.flights); u64(p.flights_out); u64(p.flights_in); u64(p.calls);
     }
-    yhat_ = yhat;
-    stage_ = 2;
+    u64(iter_wall_s.size());
+    for (double v : iter_wall_s) dbl(v);
+    dbl(peak_rss_mib);
+    u64(net.sent); u64(net.recv); u64(net.flights_out); u64(net.flights_in);
+    u64(threads); u64(enc_with_msk);
+    return b;
   }
-  // R3: sk_e = <e, s_bwd> mod q (32 bytes into out). The authority knows y and the yhat
-  // it was asked about, so it also checks e = yhat - MAXQ*y (a cheap sanity check; the
-  // model is semi-honest).
-  void bwd_key(const std::vector<int64_t>& e, uint8_t* out) {
-    expect(2, "backward key");
-    if ((int)e.size() != P_.batch) throw std::runtime_error("backward key request: wrong length");
-    for (int i = 0; i < P_.batch; ++i)
-      if (e[(size_t)i] != yhat_[(size_t)i] - P_.maxq * D_.Y(t_, i))
-        throw std::runtime_error("backward key request: e is not yhat - label");
-    feip::serialize_key(feip::key_derive(bwd_msk_, e), out);
-    stage_ = 0;
-    ++t_;
+  static PartyReport deserialize(const std::vector<uint8_t>& b) {
+    size_t k = 0;
+    auto u64 = [&]() {
+      if (k + 8 > b.size()) throw std::runtime_error("report: truncated");
+      uint64_t v = 0;
+      for (int i = 0; i < 8; ++i) v |= uint64_t(b[k + size_t(i)]) << (8 * i);
+      k += 8;
+      return v;
+    };
+    auto dbl = [&]() {
+      const uint64_t u = u64();
+      double v;
+      std::memcpy(&v, &u, 8);
+      return v;
+    };
+    PartyReport r;
+    const uint64_t np = u64();
+    if (np > 4096) throw std::runtime_error("report: too many phases");
+    for (uint64_t q = 0; q < np; ++q) {
+      const uint64_t len = u64();
+      if (len > 256 || k + len > b.size()) throw std::runtime_error("report: bad phase name");
+      std::string n(b.begin() + long(k), b.begin() + long(k + len));
+      k += len;
+      PhaseStat p;
+      p.wall_s = dbl(); p.cpu_s = dbl();
+      p.sent = u64(); p.recv = u64(); p.flights = u64(); p.flights_out = u64(); p.flights_in = u64(); p.calls = u64();
+      r.phases.emplace_back(std::move(n), p);
+    }
+    const uint64_t ni = u64();
+    if (ni > (uint64_t(1) << 24)) throw std::runtime_error("report: too many iterations");
+    for (uint64_t q = 0; q < ni; ++q) r.iter_wall_s.push_back(dbl());
+    r.peak_rss_mib = dbl();
+    r.net.sent = u64(); r.net.recv = u64(); r.net.flights_out = u64(); r.net.flights_in = u64();
+    r.threads = u64(); r.enc_with_msk = u64();
+    if (k != b.size()) throw std::runtime_error("report: trailing bytes");
+    return r;
   }
-  int iteration() const { return t_; }
-
- private:
-  void expect(int stage, const char* what) const {
-    if (t_ >= P_.iters) throw std::runtime_error(std::string(what) + " requested after the last iteration");
-    if (stage_ != stage) throw std::runtime_error(std::string(what) + " requested out of order");
-  }
-
-  Params P_;
-  Dataset D_;
-  std::vector<int64_t> w0_;
-  int threads_;
-  bool msk_enc_;
-  bool have_keys_ = false;
-  feip::Mpk fwd_mpk_, bwd_mpk_;
-  feip::Msk fwd_msk_, bwd_msk_;
-  febo::Mpk bo_mpk_;
-  febo::Msk bo_msk_;
-  std::vector<Point> cmt_;  // FEBO commitments g^r, [t][i]
-  std::vector<uint8_t> upload_;
-  std::vector<int64_t> yhat_;
-  int t_ = 0, stage_ = 0;
 };
 
-// ============================================================= the server
-// Per-kind statistics of the bounded discrete logs (for the bound-safety tests/report).
+inline void send_report(Channel& ch, const PartyReport& r) {
+  ch.send_blob(r.serialize());
+  ch.flush();
+}
+inline PartyReport recv_report(Channel& ch) { return PartyReport::deserialize(ch.recv_blob(uint64_t(1) << 24)); }
+
+// ------------------------------------------------------------- dlog stats
 struct DlogStats {
-  uint64_t calls = 0;
-  int64_t max_abs = 0;     // largest |value| recovered
-  int64_t max_bound = 0;   // largest bound used
-  double max_ratio = 0;    // max |value| / bound (<= 1)
-  void add(int64_t v, int64_t bound) {
-    ++calls;
-    const int64_t a = v < 0 ? -v : v;
-    max_abs = std::max(max_abs, a);
+  int table_bits = 0;
+  size_t entries = 0, memory_bytes = 0;
+  int64_t half_width = 0;
+  int64_t max_bound_ff = 0, max_bound_eval = 0, max_bound_bp = 0;  // largest bound passed to solve()
+  int64_t max_abs_ff = 0, max_abs_eval = 0, max_abs_bp = 0;        // largest |value| recovered
+  int64_t max_steps_needed = 0;  // giant-step lookups the hardest solve needed (0 = table hit)
+  int64_t worst_case_steps = 0;  // Dlog::max_giant_steps(largest bound)
+  uint64_t solves = 0;
+};
+
+// Giant-step lookups solve() performs before finding v (k = 0 first, then +1, -1, +2, ...).
+inline int64_t giant_steps_needed(const Dlog& L, int64_t v) {
+  const int64_t m = L.half_width(), M = L.giant_stride();
+  const int64_t k = v >= 0 ? (v + m) / M : -((-v + m) / M);
+  return k == 0 ? 0 : (k > 0 ? 2 * k - 1 : -2 * k);
+}
+
+// --------------------------------------------------------------- results
+struct ClientResult {
+  PartyReport rep;
+  std::vector<int64_t> final_w;  // only with send_model
+};
+struct ServerResult {
+  PartyReport rep;
+  std::vector<int64_t> w0, w;                  // received initial weights, trained weights
+  std::vector<std::vector<int64_t>> w_after;   // weights after each iteration
+  DlogStats dlog;
+};
+
+// ================================================================== CLIENT
+inline ClientResult run_client(Channel& ch, const ProtoOptions& O, const Dataset& D,
+                               const std::vector<int64_t>& w0) {
+  const Params& P = O.P;
+  if (D.iters != P.iters || D.batch != P.batch || D.d != P.d)
+    throw std::invalid_argument("run_client: dataset shape does not match the parameters");
+  if (w0.size() != size_t(P.d)) throw std::invalid_argument("run_client: |w0| != d");
+  for (int64_t v : w0)
+    if (v < P.minq || v > P.maxq) throw std::invalid_argument("run_client: w0 is not a qbits-bit quantized vector");
+  for (int64_t v : D.x)
+    if (v < P.minq || v > P.maxq) throw std::invalid_argument("run_client: feature outside [MINQ, MAXQ]");
+
+  WorkerPool pool(O.threads);
+  const size_t T = size_t(P.iters), B = size_t(P.batch), d = size_t(P.d);
+  const CommFormula F = comm_formula(P, O.send_model);
+  Metrics M;
+  ClientResult R;
+  Mark m = M.now(&ch);
+
+  // ---- 0. handshake ----
+  const auto hdr = encode_header(P, O.send_model);
+  ch.send(hdr.data(), hdr.size());
+  ch.flush();
+  M.record("pre/handshake", m, &ch);
+  uint8_t status = 0xff;
+  ch.recv(&status, 1);
+  M.record("pre/wait_ack", m, &ch);
+  if (status != 0)
+    throw std::runtime_error("the server rejected the public parameters (they differ from its own; see the "
+                             "server log). client: " + decode_header(hdr.data()).str());
+
+  // ---- 1. FE setup (the client is the authority) ----
+  const auto fe_ff = feip::setup(P.d), fe_bp = feip::setup(P.batch);
+  const auto fe_bo = febo::setup();
+  const feip::Mpk& mpk_ff = fe_ff.first;
+  const feip::Msk& msk_ff = fe_ff.second;
+  const feip::Mpk& mpk_bp = fe_bp.first;
+  const feip::Msk& msk_bp = fe_bp.second;
+  const febo::Mpk& mpk_bo = fe_bo.first;
+  const febo::Msk& msk_bo = fe_bo.second;
+  M.record("pre/fe_setup", m, &ch);
+
+  // ---- encryption (Algorithm 1), parallel over ciphertexts ----
+  const size_t n_ff = T * B, n_bp = T * d, n_bo = T * B;
+  std::vector<feip::Ct> ct_ff(n_ff), ct_bp(n_bp);
+  std::vector<febo::Ct> ct_bo(n_bo);
+  pool.parallel_for(n_ff + n_bp + n_bo, [&](size_t k) {
+    if (k < n_ff) {  // row (t, i): x_{t,i,:}
+      const int t = int(k / B), i = int(k % B);
+      std::vector<int64_t> x(d);
+      for (size_t j = 0; j < d; ++j) x[j] = D.X(t, i, int(j));
+      ct_ff[k] = O.enc_with_msk ? feip::encrypt_with_msk(msk_ff, x) : feip::encrypt(mpk_ff, x);
+    } else if (k < n_ff + n_bp) {  // column (t, j): x_{t,:,j}
+      const size_t q = k - n_ff;
+      const int t = int(q / d), j = int(q % d);
+      std::vector<int64_t> x(B);
+      for (size_t i = 0; i < B; ++i) x[i] = D.X(t, int(i), j);
+      ct_bp[q] = O.enc_with_msk ? feip::encrypt_with_msk(msk_bp, x) : feip::encrypt(mpk_bp, x);
+    } else {  // label (t, i)
+      const size_t q = k - n_ff - n_bp;
+      ct_bo[q] = febo::encrypt(mpk_bo, P.maxq * D.Y(int(q / B), int(q % B)));
+    }
+  });
+  M.record("pre/encrypt", m, &ch);
+
+  // ---- serialization: ct_ff[t][i] | ct_bp[t][j] | ct_bo[t][i] | w0 (int32 LE) ----
+  std::vector<uint8_t> up(F.upload);
+  const size_t sz_ff = feip::ct_bytes(P.d), sz_bp = feip::ct_bytes(P.batch);
+  const size_t off_bp = n_ff * sz_ff, off_bo = off_bp + n_bp * sz_bp, off_w = off_bo + n_bo * febo::kCtBytes;
+  pool.parallel_for(n_ff + n_bp + n_bo, [&](size_t k) {
+    if (k < n_ff) feip::serialize(ct_ff[k], up.data() + k * sz_ff);
+    else if (k < n_ff + n_bp) feip::serialize(ct_bp[k - n_ff], up.data() + off_bp + (k - n_ff) * sz_bp);
+    else febo::serialize(ct_bo[k - n_ff - n_bp], up.data() + off_bo + (k - n_ff - n_bp) * febo::kCtBytes);
+  });
+  for (size_t j = 0; j < d; ++j) detail::put_i32(up.data() + off_w + 4 * j, w0[j], "w0");
+  if (off_w + 4 * d != up.size()) throw std::logic_error("run_client: upload layout");
+  // Only the FEBO commitments are needed later (key derivation for '-').
+  std::vector<Point> cmt(n_bo);
+  for (size_t k = 0; k < n_bo; ++k) cmt[k] = std::move(ct_bo[k].cmt);
+  std::vector<feip::Ct>().swap(ct_ff);
+  std::vector<feip::Ct>().swap(ct_bp);
+  std::vector<febo::Ct>().swap(ct_bo);
+  M.record("pre/serialize", m, &ch);
+
+  ch.send(up.data(), up.size());  // the whole upload is one flight
+  ch.flush();
+  std::vector<uint8_t>().swap(up);
+  M.record("pre/upload", m, &ch);
+
+  // ---- ONLINE: answer the server's key requests (the client is the authority) ----
+  std::vector<uint8_t> keys(B * febo::kKeyBytes);
+  uint8_t sk[kScalarBytes];
+  for (int t = 0; t < P.iters; ++t) {
+    const Mark it0 = m;
+    // a. secure feed-forward: sk_w for the current model
+    const int64_t wb = weight_bound(P, t);
+    const std::vector<int64_t> w = ch.recv_i32s(d, -wb, wb);
+    M.record("online/wait", m, &ch);
+    feip::serialize_key(feip::key_derive(msk_ff, w), sk);
+    M.record("online/keyderive_ff", m, &ch);
+    ch.send(sk, kScalarBytes);
+    ch.flush();
+    M.record("online/send", m, &ch);
+    // b. secure evaluation: FEBO '-' keys for yhat_i
+    const std::vector<int64_t> yhat = ch.recv_i32s(B, 0, P.maxq);
+    M.record("online/wait", m, &ch);
+    pool.parallel_for(B, [&](size_t i) {
+      febo::serialize_key(febo::key_derive(msk_bo, cmt[size_t(t) * B + i], febo::Op::Sub, yhat[i]),
+                          keys.data() + i * febo::kKeyBytes);
+    });
+    M.record("online/keyderive_eval", m, &ch);
+    ch.send(keys.data(), keys.size());
+    ch.flush();
+    M.record("online/send", m, &ch);
+    // c. secure back-propagation: sk_e for the batch errors
+    const std::vector<int64_t> e = ch.recv_i32s(B, -P.maxq, P.maxq);
+    M.record("online/wait", m, &ch);
+    feip::serialize_key(feip::key_derive(msk_bp, e), sk);
+    M.record("online/keyderive_bp", m, &ch);
+    ch.send(sk, kScalarBytes);
+    ch.flush();
+    M.record("online/send", m, &ch);
+    R.rep.iter_wall_s.push_back(phase_diff(it0, m).wall_s);
+    if (!O.quiet) std::printf("[client] iteration %2d/%d keyed (%.2f ms)\n", t + 1, P.iters, R.rep.iter_wall_s.back() * 1e3);
+  }
+
+  if (O.send_model) {
+    const int64_t wb = weight_bound(P, P.iters);
+    R.final_w = ch.recv_i32s(d, -wb, wb);
+    M.record("output/wait_model", m, &ch);
+  }
+
+  R.rep.phases = M.phases();
+  R.rep.net = ch.counters();
+  R.rep.peak_rss_mib = double(peak_rss_kib()) / 1024.0;
+  R.rep.threads = uint64_t(pool.threads());
+  R.rep.enc_with_msk = O.enc_with_msk ? 1 : 0;
+  return R;
+}
+
+// ================================================================== SERVER
+inline ServerResult run_server(Channel& ch, const ProtoOptions& O) {
+  const Params& P = O.P;
+  WorkerPool pool(O.threads);
+  const size_t T = size_t(P.iters), B = size_t(P.batch), d = size_t(P.d);
+  const CommFormula F = comm_formula(P, O.send_model);
+  Metrics M;
+  ServerResult R;
+  Mark m = M.now(&ch);
+
+  // ---- 0. handshake ----
+  uint8_t hb[kHeaderBytes];
+  ch.recv(hb, kHeaderBytes);
+  M.record("pre/wait_header", m, &ch);
+  const auto mine = encode_header(P, O.send_model);
+  const bool same = std::memcmp(hb, mine.data(), kHeaderBytes) == 0;
+  const uint8_t status = same ? 0 : 1;
+  ch.send(&status, 1);
+  ch.flush();
+  M.record("pre/handshake", m, &ch);
+  if (!same)
+    throw std::runtime_error("public parameter mismatch: client sent [" + decode_header(hb).str() +
+                             "], server has [" + decode_header(mine.data()).str() +
+                             "]; both parties must pass the same --d --iters --batch --qbits --lr "
+                             "--no-bias --send-model");
+
+  // ---- 2. BSGS table (input independent; overlaps the client's encryption) ----
+  const Dlog L(O.dlog_bits > 0 ? O.dlog_bits : auto_dlog_bits(P), O.threads);
+  M.record("pre/dlog_table", m, &ch);
+
+  // ---- receive + deserialize (validates every point) the upload ----
+  const std::vector<uint8_t> up = ch.recv_bytes(F.upload);
+  M.record("pre/wait_upload", m, &ch);
+  const size_t n_ff = T * B, n_bp = T * d, n_bo = T * B;
+  const size_t sz_ff = feip::ct_bytes(P.d), sz_bp = feip::ct_bytes(P.batch);
+  const size_t off_bp = n_ff * sz_ff, off_bo = off_bp + n_bp * sz_bp, off_w = off_bo + n_bo * febo::kCtBytes;
+  std::vector<feip::Ct> ct_ff(n_ff), ct_bp(n_bp);
+  std::vector<febo::Ct> ct_bo(n_bo);
+  pool.parallel_for(n_ff + n_bp + n_bo, [&](size_t k) {
+    if (k < n_ff) ct_ff[k] = feip::deserialize(up.data() + k * sz_ff, P.d);
+    else if (k < n_ff + n_bp) ct_bp[k - n_ff] = feip::deserialize(up.data() + off_bp + (k - n_ff) * sz_bp, P.batch);
+    else ct_bo[k - n_ff - n_bp] = febo::deserialize(up.data() + off_bo + (k - n_ff - n_bp) * febo::kCtBytes);
+  });
+  R.w0.resize(d);
+  for (size_t j = 0; j < d; ++j) {
+    R.w0[j] = detail::get_i32(up.data() + off_w + 4 * j);
+    if (R.w0[j] < P.minq || R.w0[j] > P.maxq)
+      throw std::runtime_error("received w0[" + std::to_string(j) + "] = " + std::to_string(R.w0[j]) +
+                               " is not a qbits-bit quantized value");
+  }
+  M.record("pre/deserialize", m, &ch);
+
+  // ---- ONLINE ----
+  DlogStats& S = R.dlog;
+  S.table_bits = L.table_bits();
+  S.entries = L.table_entries();
+  S.memory_bytes = L.memory_bytes();
+  S.half_width = L.half_width();
+  auto solve = [&L](const Point& Pt, int64_t bound, const char* what, int t, size_t idx) {
+    const std::optional<int64_t> v = L.solve(Pt, bound);
+    if (!v)
+      throw std::runtime_error(std::string("dlog failed (") + what + ", iteration " + std::to_string(t + 1) +
+                               ", index " + std::to_string(idx) + ", bound " + std::to_string(bound) + ")");
+    return *v;
+  };
+  auto note = [&](const std::vector<int64_t>& vals, int64_t bound, int64_t& max_bound, int64_t& max_abs) {
     max_bound = std::max(max_bound, bound);
-    if (bound > 0) max_ratio = std::max(max_ratio, (double)a / (double)bound);
-  }
-};
-
-class CnServer {
- public:
-  enum Kind { FWD = 0, FEBO = 1, BWD = 2 };
-
-  CnServer(const Params& P, const Dlog& dl, int threads) : P_(P), dl_(dl), threads_(std::max(1, threads)) {
-    check_protocol_params(P_);
-    K_ = int64_t(1) << P_.k_shift;
-  }
-
-  // Header check, w0, and every ciphertext deserialized (each point validated on P-256).
-  void parse_upload(const uint8_t* data, size_t n) {
-    const UploadLayout L = upload_layout(P_);
-    if (n != L.total)
-      throw std::runtime_error("upload has " + std::to_string(n) + " bytes, expected " + std::to_string(L.total));
-    check_header(data, P_);
-    w_.assign((size_t)P_.d, 0);
-    for (int j = 0; j < P_.d; ++j) w_[(size_t)j] = get_i32(data + L.off_w0 + 4 * (size_t)j);
-    const size_t n_fwd = (size_t)P_.iters * P_.batch, n_bwd = (size_t)P_.iters * P_.d_data, n_bo = n_fwd;
-    fwd_.assign(n_fwd, feip::Ct{});
-    bwd_.assign(n_bwd, feip::Ct{});
-    bo_.assign(n_bo, febo::Ct{});
-    parallel_for(threads_, n_fwd + n_bwd + n_bo, [&](size_t k) {
-      if (k < n_fwd)
-        fwd_[k] = feip::deserialize(data + L.off_fwd + k * L.fwd_ct, P_.d_data);
-      else if (k < n_fwd + n_bwd)
-        bwd_[k - n_fwd] = feip::deserialize(data + L.off_bwd + (k - n_fwd) * L.bwd_ct, P_.batch);
-      else
-        bo_[k - n_fwd - n_bwd] = febo::deserialize(data + L.off_febo + (k - n_fwd - n_bwd) * L.febo_ct);
-    });
-    w0_ = w_;
-    parsed_ = true;
-  }
-
-  const std::vector<int64_t>& weights() const { return w_; }
-  const std::vector<int64_t>& initial_weights() const { return w0_; }
-  int iteration() const { return t_; }
-
-  // R1 request: the data-column weights w_0..w_{d_data-1}.
-  std::vector<int64_t> fwd_request() const {
-    expect(0, "forward request");
-    return std::vector<int64_t>(w_.begin(), w_.begin() + P_.d_data);
-  }
-  // R1 response: B FEIP decryptions + dlogs, then z and yhat in the clear.
-  void fwd_finish(const uint8_t* key, Metrics* M) {
-    expect(0, "forward decryption");
-    const Scalar sk = feip::deserialize_key(key);
-    const std::vector<int64_t> wd = fwd_request();
-    int64_t bound = 0;
-    for (int64_t v : wd) bound += v < 0 ? -v : v;
-    bound <<= P_.f;  // |x| <= 2^f
-    Mark m = mark_now();
-    std::vector<Point> g((size_t)P_.batch);
-    parallel_for(threads_, (size_t)P_.batch, [&](size_t i) {
-      g[i] = feip::decrypt_to_group(fwd_[(size_t)t_ * P_.batch + i], sk, wd);
-    });
-    if (M) M->record("fwd_decrypt", m);
-    std::vector<int64_t> dot((size_t)P_.batch);
-    solve_all(g, bound, FWD, dot, "forward <w, x_i>");
-    if (M) M->record("fwd_dlog", m);
-    const int64_t wb = P_.bias ? w_[(size_t)P_.d - 1] * P_.maxq : 0;  // bias column x = MAXQ
-    yhat_.assign((size_t)P_.batch, 0);
-    z_.assign((size_t)P_.batch, 0);
-    for (int i = 0; i < P_.batch; ++i) {
-      z_[(size_t)i] = trunc_f(dot[(size_t)i] + wb, P_.f);
-      yhat_[(size_t)i] = qsigmoid_ref(z_[(size_t)i], P_.f);
+    for (int64_t v : vals) {
+      max_abs = std::max(max_abs, v < 0 ? -v : v);
+      S.max_steps_needed = std::max(S.max_steps_needed, giant_steps_needed(L, v));
+      ++S.solves;
     }
-    if (M) M->record("plain_lr", m);
-    stage_ = 1;
-  }
-  const std::vector<int64_t>& yhat() const { return yhat_; }
-  const std::vector<int64_t>& z() const { return z_; }
+  };
 
-  // R2 response: B FEBO '-' decryptions (g^{MAXQ*y_i - yhat_i}) + dlogs; e = -(that).
-  void eval_finish(const uint8_t* keys, Metrics* M) {
-    expect(1, "FEBO decryption");
-    Mark m = mark_now();
-    std::vector<Point> g((size_t)P_.batch);
-    parallel_for(threads_, (size_t)P_.batch, [&](size_t i) {
-      const Point sk = febo::deserialize_key(keys + i * febo::kKeyBytes);
-      g[i] = febo::decrypt_to_group(bo_[(size_t)t_ * P_.batch + i], sk, febo::Op::Sub, yhat_[i]);
-    });
-    if (M) M->record("febo_decrypt", m);
-    std::vector<int64_t> diff((size_t)P_.batch);
-    solve_all(g, P_.maxq + P_.maxq, FEBO, diff, "FEBO label - yhat");
-    if (M) M->record("febo_dlog", m);
-    e_.assign((size_t)P_.batch, 0);
-    for (int i = 0; i < P_.batch; ++i) e_[(size_t)i] = -diff[(size_t)i];
-    if (M) M->record("plain_lr", m);
-    stage_ = 2;
-  }
-  const std::vector<int64_t>& err() const { return e_; }
-
-  // R3 response: d_data FEIP decryptions (<e, column j>) + dlogs, then the update.
-  void bwd_finish(const uint8_t* key, Metrics* M) {
-    expect(2, "backward decryption");
-    const Scalar sk = feip::deserialize_key(key);
-    int64_t bound = 0, esum = 0;
-    for (int64_t v : e_) bound += v < 0 ? -v : v, esum += v;
-    bound <<= P_.f;
-    Mark m = mark_now();
-    std::vector<Point> g((size_t)P_.d_data);
-    parallel_for(threads_, (size_t)P_.d_data, [&](size_t j) {
-      g[j] = feip::decrypt_to_group(bwd_[(size_t)t_ * P_.d_data + j], sk, e_);
-    });
-    if (M) M->record("bwd_decrypt", m);
-    std::vector<int64_t> gfull((size_t)P_.d_data);
-    solve_all(g, bound, BWD, gfull, "backward <e, x_.j>");
-    if (M) M->record("bwd_dlog", m);
-    if (P_.bias) gfull.push_back(P_.maxq * esum);  // bias column x = MAXQ
-    for (int j = 0; j < P_.d; ++j)
-      w_[(size_t)j] = (K_ * w_[(size_t)j] - trunc_f(gfull[(size_t)j], P_.f)) / K_;
-    if (M) M->record("plain_lr", m);
-    stage_ = 0;
-    ++t_;
-  }
-
-  // TEST ONLY: every dlog bound becomes min(bound, cap), cap >= 0 (to show that a too
-  // small bound is detected). A negative cap disables it.
-  void set_test_bound_cap(int64_t cap) { cap_ = cap; }
-  const DlogStats& stats(Kind k) const { return stats_[k]; }
-
- private:
-  void expect(int stage, const char* what) const {
-    if (!parsed_) throw std::logic_error(std::string(what) + " before the upload was parsed");
-    if (t_ >= P_.iters) throw std::logic_error(std::string(what) + " after the last iteration");
-    if (stage_ != stage) throw std::logic_error(std::string(what) + " out of order");
-  }
-
-  void solve_all(const std::vector<Point>& g, int64_t bound, Kind kind, std::vector<int64_t>& out,
-                 const char* what) {
-    const int64_t b = cap_ >= 0 ? std::min(bound, cap_) : bound;
-    std::vector<char> ok(g.size(), 0);
-    parallel_for(threads_, g.size(), [&](size_t k) {
-      const auto v = dl_.solve(g[k], b);
-      if (v) out[k] = *v, ok[k] = 1;
-    });
-    for (size_t k = 0; k < g.size(); ++k) {
-      if (!ok[k])
-        throw DlogError("bounded discrete log FAILED for " + std::string(what) + " (iteration " +
-                        std::to_string(t_) + ", index " + std::to_string(k) + "): no value in [-" +
-                        std::to_string(b) + ", " + std::to_string(b) + "]" +
-                        (b < bound ? " -- the bound was capped by --test-bound-cap (test only)" : ""));
-      stats_[kind].add(out[k], b);
+  const int64_t K = int64_t(1) << P.k_shift;
+  std::vector<int64_t> w = R.w0, zfull(B), yhat(B), e(B), gfull(d);
+  std::vector<uint8_t> keys(B * febo::kKeyBytes);
+  uint8_t sk[kScalarBytes];
+  for (int t = 0; t < P.iters; ++t) {
+    const Mark it0 = m;
+    // a. secure feed-forward
+    ch.send_i32s(w);
+    ch.flush();
+    M.record("online/send", m, &ch);
+    ch.recv(sk, kScalarBytes);
+    M.record("online/wait", m, &ch);
+    {
+      const Scalar sk_w = feip::deserialize_key(sk);
+      int64_t bound = 0;
+      for (int64_t v : w) bound += (v < 0 ? -v : v) << P.f;  // |x| <= 2^f
+      pool.parallel_for(B, [&](size_t i) {
+        zfull[i] = solve(feip::decrypt_to_group(ct_ff[size_t(t) * B + i], sk_w, w), bound, "feed-forward", t, i);
+      });
+      note(zfull, bound, S.max_bound_ff, S.max_abs_ff);
+    }
+    M.record("online/decrypt_ff", m, &ch);
+    for (size_t i = 0; i < B; ++i) yhat[i] = qsigmoid_ref(trunc_f(zfull[i], P.f), P.f);
+    M.record("online/sigmoid", m, &ch);
+    // b. secure evaluation (FEBO '-'): label_i - yhat_i
+    ch.send_i32s(yhat);
+    ch.flush();
+    M.record("online/send", m, &ch);
+    ch.recv(keys.data(), keys.size());
+    M.record("online/wait", m, &ch);
+    {
+      std::vector<int64_t> diff(B);
+      pool.parallel_for(B, [&](size_t i) {
+        const Point key = febo::deserialize_key(keys.data() + i * febo::kKeyBytes);
+        diff[i] = solve(febo::decrypt_to_group(ct_bo[size_t(t) * B + i], key, febo::Op::Sub, yhat[i]), P.maxq,
+                        "evaluation", t, i);
+      });
+      note(diff, P.maxq, S.max_bound_eval, S.max_abs_eval);
+      for (size_t i = 0; i < B; ++i) {
+        const int64_t label = diff[i] + yhat[i];
+        if (label != 0 && label != P.maxq)
+          throw std::runtime_error("evaluation: decrypted label " + std::to_string(label) + " is not 0 or MAXQ");
+        e[i] = -diff[i];  // yhat_i - label_i
+      }
+    }
+    M.record("online/decrypt_eval", m, &ch);
+    // c. secure back-propagation
+    ch.send_i32s(e);
+    ch.flush();
+    M.record("online/send", m, &ch);
+    ch.recv(sk, kScalarBytes);
+    M.record("online/wait", m, &ch);
+    {
+      const Scalar sk_e = feip::deserialize_key(sk);
+      int64_t bound = 0;
+      for (int64_t v : e) bound += (v < 0 ? -v : v) << P.f;
+      pool.parallel_for(d, [&](size_t j) {
+        gfull[j] = solve(feip::decrypt_to_group(ct_bp[size_t(t) * d + j], sk_e, e), bound, "back-propagation", t, j);
+      });
+      note(gfull, bound, S.max_bound_bp, S.max_abs_bp);
+    }
+    M.record("online/decrypt_bp", m, &ch);
+    const int64_t wb = weight_bound(P, t + 1);
+    for (size_t j = 0; j < d; ++j) {
+      w[j] = (K * w[j] - trunc_f(gfull[j], P.f)) / K;  // C++ '/' truncates toward zero
+      if (w[j] < -wb || w[j] > wb) throw std::logic_error("updated weight outside its public bound");
+    }
+    R.w_after.push_back(w);
+    M.record("online/update", m, &ch);
+    R.rep.iter_wall_s.push_back(phase_diff(it0, m).wall_s);
+    if (!O.quiet) {
+      std::printf("[server] iteration %2d/%d done (%.2f ms) w =", t + 1, P.iters, R.rep.iter_wall_s.back() * 1e3);
+      for (size_t j = 0; j < d && j < 8; ++j) std::printf(" %lld", (long long)w[j]);
+      std::printf("%s\n", d > 8 ? " ..." : "");
     }
   }
+  S.worst_case_steps = L.max_giant_steps(std::max({S.max_bound_ff, S.max_bound_eval, S.max_bound_bp}));
 
-  Params P_;
-  const Dlog& dl_;
-  int threads_;
-  int64_t K_ = 1;
-  int64_t cap_ = -1;
-  bool parsed_ = false;
-  std::vector<int64_t> w_, w0_, yhat_, z_, e_;
-  std::vector<feip::Ct> fwd_, bwd_;
-  std::vector<febo::Ct> bo_;
-  int t_ = 0, stage_ = 0;
-  DlogStats stats_[3];
-};
-
-// BSGS table size for --bsgs-bits auto: one lookup covers the worst-case forward value
-// of the INITIAL weights (|w_j| <= 2^f, |x| <= 2^f: 2^(2f) * d_data), clamped to
-// [12, 20] bits. Larger values (weights grow during training, or qbits > 6 with large d)
-// cost ~1 us per extra giant step instead of a bigger table (20 bits: ~1 s, 24 MiB).
-inline int auto_bsgs_bits(const Params& P) {
-  const int64_t bound = (int64_t(1) << (2 * P.f)) * (int64_t)P.d_data;
-  return Dlog::bits_for_bound(bound, 12, 20);
+  if (O.send_model) {
+    ch.send_i32s(w);
+    ch.flush();
+    M.record("output/send_model", m, &ch);
+  }
+  R.w = w;
+  R.rep.phases = M.phases();
+  R.rep.net = ch.counters();
+  R.rep.peak_rss_mib = double(peak_rss_kib()) / 1024.0;
+  R.rep.threads = uint64_t(pool.threads());
+  return R;
 }
 
 }  // namespace lrcn

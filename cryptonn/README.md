@@ -1,307 +1,185 @@
-# Baseline 3: CryptoNN (functional encryption, semi-honest with a trusted authority)
+# Baseline 3: CryptoNN (functional encryption)
 
-This baseline trains logistic regression the way **CryptoNN** does it (Xu, Joshi, Li, *CryptoNN: Training Neural
-Networks over Encrypted Data*, ICDCS 2019, arXiv:1904.07303):
-- the server holds the model **in the clear**;
-- the steps that touch the training data use **functional encryption**:
-  - **FEIP**, the DDH inner-product scheme of Abdalla, Bourse, De Caro and Pointcheval (PKC 2015), paper Sec. II-B;
-  - **FEBO**, the paper's FE for basic operations (Sec. III-B).
+This baseline trains logistic regression the way **CryptoNN** does (Xu, Joshi, Li, *CryptoNN: Training Neural Networks
+over Encrypted Data*, ICDCS 2019). The server trains a model that it holds **in the clear**. The data reaches it only
+**functionally encrypted**, and a trusted authority gives it function keys for exactly the inner products and
+differences that training needs. The schemes are FEIP, the DDH-based inner-product FE of Abdalla et al. (PKC 2015), and
+the paper's FEBO for basic operations. Both run over NIST P-256 (OpenSSL 3 libcrypto). There are no third-party
+sources.
 
-The group is NIST P-256 (128-bit security), through the OpenSSL 3 libcrypto EC API.
+In this two-party setting, the FE authority is merged into the client:
 
 | role | holds | learns |
 |---|---|---|
-| **client** = data owner **and** CryptoNN authority | the training data (x, y), the initial weights w0 (random for now), every master secret key | every w_t, yhat_i and e_i (from the key requests) |
-| **server** = model holder | the model, in the clear (it receives w0 at setup) | the trained weights and every intermediate value listed under [Leakage](#security-model-and-leakage) |
+| **client** = data owner + FE authority | the training data (x, y), the initial weights w0 (random for now), every master secret key (`msk_ff`, `msk_bp`, `msk_bo`) | every function input it is asked to key: w, ŷ, e |
+| **server** = model trainer | the ciphertexts, the model w in the clear | w0, every intermediate w, z, ŷ, e, g, and therefore the labels; ends with the trained model |
 
-CryptoNN has three roles: the authority, the clients and the server. The two-party setting merges the authority into
-the client. The client generates every key and answers the server's function-key requests. Nobody else holds a master
-secret key.
+The training is the same quantized fixed-point LR as the sibling baselines (`include/lr_params.h` and
+`include/lr_reference.h` are copies of the GC baseline's). The same `--seed` gives the same data and initial weights in
+all three baselines. The defaults are qbits = 6 (values in [-32, 31]/32), batch = 4, lr = 0.5 (K = batch/lr = 8),
+20 iterations, and d features including the bias column. The protocol's result equals `reference_train` **bit for
+bit**. The selftest checks this, and so does `--verify` on a real run, after every iteration.
 
-The training parameters are those of the FE code and of the other two baselines:
-- **6 quantization bits** (`QUANTIZATION_BITS=6`), **batch = 4**, **learning rate = 0.5**;
-- **20 iterations**, with the bias as the last feature (`x = MAXQ`);
-- `--d` is the number of features, **including** the bias column.
+## Protocol
 
-`--iters`, `--qbits`, `--batch`, `--lr`, `--no-bias`, `--zero-init` and `--seed` change the rest. The data generator is
-baseline 1's, so the same `--seed` gives the same data and initial weights in all three baselines.
+Notation: f = qbits − 1, MAXQ = 2^f − 1, K = 2^k_shift = batch/lr. Batch t holds rows i < batch, and the label value is
+MAXQ·y.
 
-## What is computed
+**Preprocessing** (paper Algorithm 1, *pre-process-encryption*):
 
-Exactly the fixed-point training of baseline 1 (`include/lr_reference.h`, a copy of `gc_ag2pc/include/lr_reference.h`).
-Values are qbits-bit integers in `[MINQ, MAXQ] = [-32, 31]` at scale `2^f`, `f = 5`. Labels are `y in {0, 1}`, with the
-label value `MAXQ * y`. `K = batch / lr = 8`. Per iteration t, for the B = 4 samples i of the batch:
+1. **Handshake.** The client sends a 40-byte public-parameter header (d, iters, batch, qbits, lr/k_shift, bias and
+   send-model flags; *not* the seed). The server replies with one status byte. If the parameters differ, both parties
+   stop with a clear error and a non-zero exit.
+2. **Client setup and encryption.** The client runs three setups: `FEIP.Setup(η = d)` → `msk_ff` (sample rows),
+   `FEIP.Setup(η = batch)` → `msk_bp` (the per-batch feature columns), and `FEBO.Setup` → `msk_bo` (labels). It then
+   encrypts with the **public** keys, as a data owner would:
+   - `ct_ff[t][i] = FEIP_ff.Enc(x_{t,i,:})`: d components
+   - `ct_bp[t][j] = FEIP_bp.Enc(x_{t,:,j})`: batch components
+   - `ct_bo[t][i] = FEBO.Enc(MAXQ·y_{t,i})`
 
-```
-zfull_i = sum_{j<d_data} w_j x_ij              FEIP fwd (server decrypts with sk_w)
-          + w_bias * MAXQ                      bias column is public: plaintext
-z_i     = zfull_i >> f                         truncation (floor), plaintext
-yhat_i  = min(floor(2^f sigmoid(z_i/2^f)), MAXQ)   exact quantized sigmoid, plaintext at the server
-e_i     = yhat_i - MAXQ y_i                    FEBO '-': decrypts to MAXQ y_i - yhat_i, the server negates it
-gfull_j = sum_i e_i x_ij,  j < d_data          FEIP bwd over the encrypted feature column (server decrypts with sk_e)
-gfull_bias = MAXQ * sum_i e_i                  plaintext
-w_j     = (K w_j - (gfull_j >> f)) / K         C++ '/', i.e. toward zero; plaintext
-```
+   `--enc-with-msk` switches to the authority's equivalent shortcut `encrypt_with_msk`, which gives the same ciphertext
+   distribution and is about 5× faster (d = 50, 1 thread: 76 ms instead of 424 ms). The client parallelizes encryption over `--threads`. All ciphertexts and w0
+   (d int32) go to the server in **one flight**.
 
-Everything is exact integer arithmetic. The decryptions recover the exact inner products, so the trained weights equal
-`reference_train` **bit for bit**. `--verify` checks this on every real run, and `lr_cryptonn_selftest` checks it after
-every iteration for 68 configurations, plus worst-case data. With `--no-bias`, all d columns are client data
-(`d_data = d`) and there are no plaintext bias terms.
+   **w0 must be revealed.** In CryptoNN the server holds the model in plaintext: it requests function keys for w, and
+   FEIP decryption takes y = w as an input. mpk is not sent, because the server never encrypts and decryption does not
+   use it.
+3. **Server preprocessing.** The server builds the BSGS discrete-log table. This is input-independent and overlaps the
+   client's encryption. It then receives and deserializes the ciphertexts, which validates every point.
 
-This is the same function as baseline 1 (the exact sigmoid, the FE code's update). Baseline 2 (MD-ML) uses a
-piecewise-linear sigmoid with probabilistic truncation.
+**Online, iteration t** (paper Algorithm 2, the LR case): 3 round trips.
 
-## The CryptoNN mapping
-
-The paper's Algorithm 2 runs the training at the server. It uses the secure matrix computation of Algorithm 1 only
-where the data appears. For logistic regression, a one-layer network, those places are:
-
-| step | paper | here |
-|---|---|---|
-| secure feed-forward `w . x_i` | FEIP: the data owner encrypts x_i, the server asks the authority for `sk_w` and decrypts `g^<w,x_i>` | FEIP fwd, eta = d_data, one ciphertext per sample |
-| secure evaluation `yhat - y` | FEBO: the label is encrypted, the server asks for the '-' key for its own `yhat_i` | FEBO, one ciphertext per sample, '-' key per sample |
-| first-layer weight gradient `X^T e` | FEIP over the feature columns, function vector e | FEIP bwd, eta = B, one ciphertext per (t, column j) |
-| sigmoid, truncations, update | plaintext at the server | plaintext at the server (`qsigmoid_ref`, `>> f`, `/ K`) |
-
-FEBO implements all four operations ('+', '-', '*', '/'), and `[4]` of the selftest tests them; the protocol needs only '-'.
-
-**The schemes**, written multiplicatively as in the paper; the code is additive, see `include/ec_group.h`:
-- **FEIP**:
-  - Setup: `s <- Z_q^eta`, `mpk = (g, h_i = g^{s_i})`.
-  - KeyDerive: `sk_y = <y, s> mod q`.
-  - Encrypt: `ct0 = g^r`, `ct_i = h_i^r g^{x_i}`.
-  - Decrypt: `g^{<x,y>} = prod ct_i^{y_i} / ct0^{sk_y}`, then a bounded discrete log.
-- **FEBO**:
-  - Setup: `h = g^s`.
-  - Encrypt: `cmt = g^r`, `ct = h^r g^x`.
-  - '-' key: `cmt^s g^{y}`; decrypt: `ct / sk = g^{x - y}`.
-  - The other operations are in `include/fe_bo.h`.
-
-**Decisions in this two-party version:**
-- **The client is the authority.** It holds the three master secret keys and derives every function key on request.
-- **w0 goes to the server in the clear** at setup. CryptoNN's server must know w to decrypt `<w, x_i>`. This is
-  inherent to the scheme, and it is reported as leakage.
-- **Three independent key sets:** FEIP fwd (eta = d_data), FEIP bwd (eta = B) and FEBO.
-- **mpk is not sent.** Decryption does not use it, and the client both encrypts and derives keys.
-- **Encryption uses the public key, as in the paper**: one double-scalar multiplication per component.
-  `--encrypt-with-msk` encrypts with the master secret key instead: `ct_i = (r s_i + x_i) g`, one fixed-base
-  multiplication per component. The ciphertext distribution is the same, and it is about 3.8 times faster at
-  d = 1000. It is possible only because the data owner is also the authority.
-- **Encodings:** points are compressed (33 bytes) and scalars are 32 bytes. Every received point is validated on the
-  curve; P-256 has cofactor 1, so this is a complete subgroup check.
-
-### Encryption layout (the client's offline upload, one flight)
-
-| section | count | size each | d = 5 (d_data = 4) | d = 100 | d = 1000 |
-|---|---|---|---|---|---|
-| header (magic, d, iters, batch, qbits, bias, lr) | 1 | 32 B | 32 B | 32 B | 32 B |
-| w0 (int32) | d | 4 B | 20 B | 400 B | 4000 B |
-| FEIP fwd: `x_i` of every sample | iters x B | (d_data+1) x 33 B | 80 x 165 B | 80 x 3300 B | 80 x 33000 B |
-| FEIP bwd: column `(x_0j..x_{B-1}j)` of every batch | iters x d_data | (B+1) x 33 = 165 B | 80 x 165 B | 1980 x 165 B | 19980 x 165 B |
-| FEBO: label value `MAXQ y_i` of every sample | iters x B | 2 x 33 = 66 B | 80 x 66 B | 80 x 66 B | 80 x 66 B |
-| **total** | | | **31732 B (30.99 KiB)** | **596412 B (582.43 KiB)** | **5946012 B (5.67 MiB)** |
-
-```
-offline client->server = 32 + 4d + iters*B*(d_data+1)*33 + iters*d_data*(B+1)*33 + iters*B*66     (server->client: 0)
-                       ~ 33 * iters * (2B+1) * d  for large d   (both FEIP encodings of the data: rows and columns)
-```
-
-### Message flow per iteration (online)
-
-| round trip | server -> client | client -> server | server work |
+| step | server → client | client → server | server computes |
 |---|---|---|---|
-| R1 | `w_0..w_{d_data-1}`: 4·d_data B | `sk_w = <w, s_fwd>`: 32 B | B FEIP decryptions (multi-exp of d_data+1 points) + B dlogs, bound `2^f sum_j abs(w_j)`; z, yhat in the clear |
-| R2 | `yhat_0..yhat_{B-1}`: 4B B | B FEBO '-' keys: 33B B | B FEBO decryptions (one point subtraction each) + B dlogs, bound `2 MAXQ` |
-| R3 | `e_0..e_{B-1}`: 4B B | `sk_e = <e, s_bwd>`: 32 B | d_data FEIP decryptions (multi-exp of B+1 points) + d_data dlogs, bound `2^f sum_i abs(e_i)`; update |
+| a. secure feed-forward | w (4d B) | `sk_w = FEIP.KeyDerive(msk_ff, w)` (32 B) | `zfull_i = dlog(FEIP.Dec(ct_ff[t][i], sk_w, w))`, bound Σ\|w_j\|·2^f; `z_i = zfull_i >> f`; `ŷ_i = qsigmoid(z_i)` |
+| b. secure evaluation (FEBO '−') | ŷ (4·batch B) | per i `FEBO.KeyDerive(msk_bo, cmt_{t,i}, −, ŷ_i)` (33 B each) | `MAXQ·y_i − ŷ_i = dlog(FEBO.Dec)`, bound MAXQ; `e_i = ŷ_i − MAXQ·y_i` |
+| c. secure back-propagation | e (4·batch B) | `sk_e = FEIP.KeyDerive(msk_bp, e)` (32 B) | `gfull_j = dlog(FEIP.Dec(ct_bp[t][j], sk_e, e))`, bound Σ\|e_i\|·2^f; `g_j = gfull_j >> f`; `w_j = (K·w_j − g_j)/K` (C++ `/`) |
 
-```
-online per iteration:  server->client 4*(d_data + 2B) B,   client->server 32 + 33B + 32 = 196 B (B = 4)
-rounds:                offline 1 flight; online 3 round trips per iteration = 60 round trips (120 flights) for 20 iterations
-```
+- The server parallelizes decryption and discrete logs over `--threads`, as the paper does: over the batch rows in (a)
+  and (b), and over the d columns in (c).
+- A failed discrete log is a hard error.
+- **Range checks.** The client is the authority, so it checks every function input before it derives a key:
+  |w_j| ≤ 2^f + t·⌊batch·MAXQ/K⌋, ŷ ∈ [0, MAXQ], |e| ≤ MAXQ. The server checks that the decrypted label is 0 or MAXQ,
+  and that the updated weights stay inside the same public bound.
+- **FEBO commitments.** The client keeps the commitments `cmt_{t,i}` it generated, so a FEBO key request carries only ŷ.
+  In the paper, the server sends `cmt` along with the request.
 
-The client answers every request without waiting for anything else. The server holds the trained weights at the end,
-and nothing more is sent. The client checks each request: lengths, `yhat` in `[0, MAXQ]`, and `e = yhat - MAXQ y`,
-which it can compute itself. Both parties check that `d / iters / batch / qbits / lr / bias` agree: the server checks
-the upload header, and both sides check again when the reports are exchanged. A mismatch aborts with a message.
+**Output.** The server ends holding the trained model, which is CryptoNN's semantics, and prints it. With `--send-model`,
+it also sends w to the client: 4d bytes, counted in a separate **output** stage.
 
-**Discrete logs.** Every decryption ends in `g^v` with a small v. The server solves it by baby-step giant-step (`include/bsgs.h`).
-- The table holds j·g for `j < 2^b`. Since j·g and -j·g share the x-coordinate, one lookup covers `[-(2^b - 1), 2^b - 1]`.
-  Giant steps go outward from 0.
-- **The bounds are exact**, because `abs(x) <= 2^f`. A solve can fail only if the protocol is broken. A failure aborts the run
-  (`DlogError`), it is never replaced by a wrong value:
-  - the selftest shows that a capped bound and a corrupted key are both detected;
-  - `--test-bound-cap 100` shows it on a real run: `[server] ERROR: bounded discrete log FAILED for forward <w, x_i> ...`,
-    and both parties exit 1.
-  - On worst-case data (all features MINQ, all weights MAXQ), the forward value reaches the bound exactly.
-- **Table size** (`--bsgs-bits auto`): the smallest b in [12, 20] whose single lookup covers the worst-case forward value of
-  the *initial* weights, `2^(2f) d_data`. This gives 13, 14, 16, 17, 19 and 20 bits for d = 5, 10, 50, 100, 500 and 1000.
-  The weights grow during training. A larger value costs about 1 µs per extra giant step instead of a bigger table:
-  the 20-bit table takes about 1 s to build and 24 MiB.
+**Report exchange** (not counted anywhere). The client sends its measurements to the server, and the server prints the
+combined report.
 
-**Threads** (`--threads N`, default 1). The client's encryption and the server's decryptions, discrete logs, upload
-validation and table build are split by index over N std::threads, as the paper parallelizes decryption. The results
-are identical for any N; this is checked by the selftest and by the d = 10 `--threads 4` run.
+## What each party learns (semi-honest)
 
-## Security model and leakage
+- **The server** learns w0 and every intermediate w, z, ŷ, e and g. Since e = ŷ − MAXQ·y and it knows ŷ, it also learns
+  **every label**. This is inherent to CryptoNN's LR: the server holds the model in the clear and decrypts these values
+  by design.
+  - The paper hides labels with a random label mapping, but that mapping is for one-hot multi-class labels. It is
+    **not applied here** for binary labels, because a permutation of {0, 1} would not hide anything once e is
+    decrypted.
+  - The server never receives x or y in the clear. It sees x only through the inner products ⟨w, x_i⟩ and ⟨e, x_{:,j}⟩
+    it is given keys for.
+- **The client (authority)** learns every w, ŷ and e it is asked to key, because the authority is merged into the
+  client.
+- **Not covered:** a malicious server. It could request keys for unit vectors and read features directly. The
+  authority's range checks do not prevent that, which is also the case in the paper. The baseline is semi-honest, like
+  the paper.
 
-- **Semi-honest, with a trusted authority.** The authority, here the client, is trusted to derive only the keys the protocol needs.
-  The server is trusted to follow the protocol. **There is no malicious security**, unlike the other two baselines:
-  - baseline 1 is authenticated garbling;
-  - baseline 2 is SPDZ2k with MAC checks.
-
-  A malicious server could simply ask for keys of other function vectors.
-- **What the server learns in the clear:**
-  - w0 and every w_t;
-  - per sample: `z_i` (and the inner product `<w, x_i>`), `yhat_i`, the label `y_i` (FEBO gives `MAXQ y_i - yhat_i`,
-    and `yhat_i` is its own), and `e_i`;
-  - per iteration: the gradient inner products `gfull_j = <e, x_.j>` for every data column;
-  - the trained weights.
-  Over many iterations these equations can reveal much of the data. CryptoNN accepts this by design: the model is the server's.
-- **What the client (authority) learns:** every w_t (R1), every `yhat_i` (R2) and every `e_i` (R3), from the key requests.
-- **Comparison with the FE protocol under evaluation** (`Functional_Encryption_for_Logistic_Regression`): that protocol
-  uses **function-hiding** inner-product FE (Kim et al.), so a function key does not reveal its vector, and the weights
-  stay hidden from the decryptor. CryptoNN's FEIP is not function-hiding. The decryptor must know y (the weights, the
-  errors) to decrypt, so CryptoNN cannot hide the model. This is the main qualitative difference to keep in mind
-  when comparing the numbers.
-
-## Install on WSL (Ubuntu 22.04/24.04)
+## Building and running
 
 ```bash
-# 1. toolchain: C++20 compiler, CMake >= 3.16, OpenSSL 3 headers (nothing else; no third-party sources)
-sudo apt update
-sudo apt install -y build-essential cmake libssl-dev
-
-# 2. build (lr_cryptonn, lr_cryptonn_selftest into ./build; BUILD_DIR=... overrides)
-cd baselines/cryptonn
-bash scripts/build.sh
-
-# 3. offline tests (--quick: ~0.3 s, 1179 checks; full: ~6 s, 3857 checks)
-./build/lr_cryptonn_selftest --quick
-
-# 4. both parties locally, with the server checking the result (test only)
-bash scripts/run_local.sh --d 5
+bash scripts/build.sh                  # needs a C++20 compiler, CMake >= 3.16, OpenSSL 3 headers (libssl-dev)
+./build/lr_cryptonn_selftest           # ~1 s; must print "selftest: ... 0 failure(s): PASS"
+scripts/run_local.sh --d 5             # both parties on this machine; the server checks the result (--verify)
+THREADS=4 scripts/run_local.sh --d 100 --iters 20
 ```
 
 By hand, in two terminals or on two machines:
 
 ```bash
-./build/lr_cryptonn server --port 23456 --d 5                     # builds the BSGS table, then listens
-./build/lr_cryptonn client --host <server-ip> --port 23456 --d 5   # encrypts, then connects (retries for 120 s)
+./build/lr_cryptonn server --port 12345 --d 5            # listens
+./build/lr_cryptonn client --host <server-ip> --port 12345 --d 5
 ```
 
-Both parties must pass the same training flags. The options are:
-- training: `--d --iters --batch --qbits --lr --seed --no-bias --zero-init`
-- protocol: `--host --port --threads N --bsgs-bits N|auto` (server), `--encrypt-with-msk` (client)
-- output: `--json FILE`, `--csv FILE` (server), `--quiet`
-- test only: `--verify` (server: regenerates the client's data from `--seed`), and `--test-bound-cap N` (server)
+Both parties must pass the same training flags; the handshake checks them. The options are:
 
-Run `--help` for details. The protocol uses one TCP port.
+- **Training:** `--d` (features incl. the bias column), `--iters` (default 20), `--batch` (default 4), `--qbits`
+  (default 6), `--lr` (default 0.5), `--no-bias`, `--send-model`, `--seed`, `--zero-init`.
+- **Protocol:**
+  - `--threads N` per party (default 1)
+  - `--enc-with-msk` (client)
+  - `--dlog-bits N` (server). The default covers max(d, batch)·2^(2f) in one lookup, capped at 22 bits (4M entries,
+    96 MiB). Larger values are found by giant steps.
+- **Output:**
+  - `--verify` (server, test only): it regenerates the client's data and w0 from `--seed`, checks the received w0 and
+    the weights after every iteration bit for bit, prints `verify: PASS|FAIL`, and exits non-zero on FAIL.
+  - `--json FILE`
+  - `--csv FILE` (server). It appends a row and writes the header for a new file. It refuses a file whose header differs.
+  - `--quiet`
 
-The scripts:
-- `run_local.sh`: `PORT=... THREADS=... VERIFY=0|1`. It writes `results/{server,client}.log`, `results/last_run.json`
-  and appends a row to `results/results.csv`.
-- `bench_sweep.sh`: `D_LIST="5 10 50 100" REPS=3 [BASE_PORT=...] bash scripts/bench_sweep.sh` writes `results/sweep.csv`.
-  Each run is checked with `--verify`.
+To sweep dimensions: `D_LIST="5 11 13 31" REPS=2 OUT=results/sweep.csv bash scripts/bench_sweep.sh`. Use `THREADS=4` for 4
+threads per party, and `VERIFY=0` to skip the check.
 
-## Metrics reported
+## Cost reporting
 
-Both parties time every phase: wall time, and process CPU time summed over all threads. Payload bytes and flights come
-from the channel's counters (`include/net.h`, without TCP/IP headers). After all measurements, the parties exchange their
-numbers over the same socket, and each prints the combined report.
+Each party measures itself with `include/metrics.h`, in contiguous phases named `stage/sub-phase`. The server prints both
+parties' tables.
 
-| party | stage | rows |
+| party | stage | sub-phases |
 |---|---|---|
-| client | **offline** | keygen (setup of the 3 key sets), encryption of all ciphertexts, send of the upload |
-| | **online** | key derivation (compute only); the rest of the online wall is messages and waiting for the server |
-| server | **offline** | BSGS baby-step table (input independent), receive of the upload, deserialization + point validation |
-| | **online** | FEIP fwd decryption (multi-exp), dlog fwd, FEBO decryption, dlog FEBO, FEIP bwd decryption, dlog bwd, plaintext LR (sigmoid, update), messages + waiting |
+| client | **preprocessing** | `handshake`, `wait_ack`, `fe_setup` (3 setups), `encrypt`, `serialize`, `upload` (sending the one upload flight; it can block while the server builds its table) |
+| client | **online** | `keyderive_ff`, `keyderive_eval`, `keyderive_bp`, `send`, `wait` (blocked on the server) |
+| server | **preprocessing** | `wait_header`, `handshake`, `dlog_table`, `wait_upload` (mostly the client's encryption time), `deserialize` (point decompression and validation) |
+| server | **online** | `decrypt_ff` / `decrypt_eval` / `decrypt_bp` (decryption + discrete logs), `sigmoid`, `update`, `send`, `wait` (blocked on the client's keys) |
 
-The client encrypts **before connecting**, and the server builds its table before accepting. So neither offline phase
-includes waiting for the other party. The client's online clock starts when the first request arrives. The time
-between its upload and that request, while the server validates the upload, is printed separately ("idle") and counted
-in neither phase.
+- **Columns.** For each stage the report gives three numbers: **wall** (elapsed at that party), **compute** (wall minus
+  the `wait*` sub-phases) and **cpu** (that process's CPU time summed over all its threads, so it is about N × wall with
+  N busy threads). It also gives the **amortized online cost per iteration** (online / iters).
+- **Communication.** Payload bytes are counted exactly by `net.h`, per direction and per stage. They are printed in B,
+  KB/MB (decimal) and KiB/MiB (binary), next to the bytes **expected from closed-form formulas**. The program warns on a
+  mismatch, and the selftest asserts equality.
+  - preprocessing c→s = 40 + iters·batch·(d+1)·33 + iters·d·(batch+1)·33 + iters·batch·66 + 4d; s→c = 1
+  - online, per iteration: s→c = 4d + 8·batch; c→s = 32 + 33·batch + 32
+  - output (only with `--send-model`): s→c = 4d
+- **Rounds.** A *flight* is a maximal run of messages in one direction, and a round trip is 2 flights. Online is exactly
+  **3·iters round trips** (6·iters flights). Preprocessing is 3 flights (handshake round trip + upload), and output is
+  1 flight.
+- **Discrete logs.** The report shows the BSGS table bits and memory, the largest bound and |value| per step, and the
+  giant-step lookups needed by the hardest solve against the worst case for the largest bound.
 
-The report also gives:
-- **communication**: each direction, offline and online, the upload broken down by section, and a check
-  against the analytic formulas above (`[measured == analytic]`);
-- **rounds**: offline flights, online flights and round trips;
-- peak RSS per party; the BSGS table; the number of discrete logs of each kind and the largest |v| / bound;
-- the leakage summary.
+Example from `results/sweep_impl.csv` (this machine, iters = 20, batch = 4, qbits = 6, public-key encryption, 1 thread
+per party, localhost; times in ms):
 
-`--json` has every phase of both parties and the server's per-iteration wall times. The `--csv` row has
-`d, iters, batch, qbits, lr, threads, bsgs_bits`, every timing, the bytes in each direction offline and online, flights,
-round trips, peak RSS and `verified`.
+| d | client pre wall | client online wall / cpu | server pre compute | server online wall / cpu | c→s pre | c→s online | s→c online | total |
+|---|---|---|---|---|---|---|---|---|
+| 5 | 53.3 | 37.6 / 5.4 | 22.6 | 24.3 / 15.5 | 37.68 KB | 3.92 KB | 1.04 KB | 42.64 KB |
+| 11 | 107.5 | 66.4 / 5.7 | 43.5 | 41.0 / 26.3 | 73.34 KB | 3.92 KB | 1.52 KB | 78.79 KB |
+| 31 | 304.0 | 127.5 / 5.6 | 131.5 | 61.2 / 55.2 | 192.22 KB | 3.92 KB | 3.12 KB | 199.27 KB |
 
-"Offline" here means *before the interactive training*. The client's encryption depends on its data but not on the
-model. The server's table depends on nothing.
-
-## Results
-
-This laptop: Intel Core 7 150U (2 performance + 8 efficiency cores, 12 threads), WSL2 Ubuntu 24.04, OpenSSL 3.0.13,
-localhost. Defaults: 20 iterations, batch 4, qbits 6, lr 0.5, 1 thread per party, public-key encryption. Each cell is
-the median of 3 runs from `bench_sweep.sh`. Every run passed `--verify`, and every byte count equalled the analytic
-formula.
-
-| d | 5 | 10 | 50 | 100 | 500 | 1000 |
-|---|---|---|---|---|---|---|
-| client offline (ms): keygen + encrypt + send | 32.8 | 69.6 | 353 | 704 | 3419 | 8286 |
-| client online (ms, 20 iterations) | 15.9 | 21.6 | 71.0 | 116 | 570 | 1205 |
-| server offline (ms): BSGS table + recv + validate | 16.5 | 33.4 | 149 | 276 | 1309 | 3086 |
-| server online (ms, 20 iterations) | 16.4 | 22.2 | 73.7 | 121 | 598 | 1266 |
-| offline client->server | 30.99 KiB | 60.01 KiB | 292.20 KiB | 582.43 KiB | 2.84 MiB | 5.67 MiB |
-| offline server->client | 0 | 0 | 0 | 0 | 0 | 0 |
-| online client->server | 3.83 KiB | 3.83 KiB | 3.83 KiB | 3.83 KiB | 3.83 KiB | 3.83 KiB |
-| online server->client | 960 B | 1.33 KiB | 4.45 KiB | 8.36 KiB | 39.61 KiB | 78.67 KiB |
-| rounds (offline flights + online round trips) | 1 + 60 | 1 + 60 | 1 + 60 | 1 + 60 | 1 + 60 | 1 + 60 |
-| BSGS table bits (auto) | 13 | 14 | 16 | 17 | 19 | 20 |
-| peak RSS client / server (MiB) | 8.0 / 8.4 | 8.1 / 8.9 | 8.2 / 12.4 | 8.6 / 16.9 | 11.4 / 49.9 | 14.9 / 91.9 |
-
-Where the time goes (d = 1000, median run):
-- **client offline**: public-key encryption, 8.3 s. That is about `iters * 2B * d_data` = 160K double-scalar multiplications
-  (~50 µs each, in an `EC_POINT_mul`) plus 20K fixed-base ones. Keygen takes 8 ms.
-- **server offline**: BSGS table 1.96 s and upload validation 1.12 s, which decompresses and checks 180K points.
-  The table took ~1 s on an idle machine; here it is built while the client encrypts on the same laptop.
-- **server online**, 1.27 s:
-  - FEIP bwd decryption 920 ms (20 x 999 multi-exps of 5 points) and dlog bwd 257 ms;
-  - FEIP fwd decryption 61 ms (20 x 4 multi-exps of 1000 points with 6- to 10-bit coefficients, by a bucket method);
-  - FEBO under 3 ms.
-- **client online**: key derivation 13 ms in total; the rest is waiting for the server.
-- **The backward pass dominates online**: it costs one decryption per feature column per iteration. The forward pass
-  costs one per sample.
-
-Variants, d = 1000, one run each:
-
-| configuration | client offline | client online | server offline | server online |
-|---|---|---|---|---|
-| defaults (1 thread, public-key encryption) | 8286 ms | 1205 ms | 3086 ms | 1266 ms |
-| `--encrypt-with-msk` | 2191 ms | 1316 ms | 3285 ms | 1384 ms |
-| `--threads 12` | 5214 ms | 453 ms | 1947 ms | 478 ms |
-| `--threads 12 --encrypt-with-msk` | 1488 ms | 411 ms | 1799 ms | 432 ms |
-
-- **Thread scaling is limited on this laptop.** It has 2 performance and 8 efficiency cores. In a local run, both
-  parties share them, and the server's table build overlaps the client's encryption. Expect better scaling on a
-  server-class machine.
-- **Communication** does not depend on the thread count or the encryption mode.
-- **Online time on localhost** is mostly server computation plus 60 round trips. On a WAN, add about 60 × RTT.
-  Raw localhost RTT is about 25 µs here.
-
-Compared with the other baselines, CryptoNN is **much cheaper**, because it gives much **less security**: the server sees
-the model and every intermediate value, and there is no malicious security. Its cost is dominated by the one-time
-encryption of the data, about 33·iters·(2B+1)·d bytes. The online phase is small: 196 B per iteration from the client
-and `4(d_data + 2B)` B from the server, in 3 round trips per iteration.
+The client's work is almost entirely preprocessing: encryption grows with iters·batch·d. Its online work is 2 + batch
+key derivations per iteration. The client's online *wall* time is mostly waiting for the server's decryptions and
+discrete logs. Online traffic does not depend on the data and grows only with d (through w).
 
 ## Files
 
 | file | contents |
 |---|---|
-| `src/lr_cryptonn.cpp` | the two-party program: offline upload, 3 round trips per iteration, report exchange, report, JSON/CSV, `--verify` |
-| `src/lr_cryptonn_selftest.cpp` | group / FEIP / FEBO / BSGS tests, in-process bit-exact training runs (68 configurations + worst-case data), dlog-bound safety |
-| `include/cryptonn_protocol.h` | the protocol as message-level state machines (`CnClient`, `CnServer`), shared by the program and the selftest; upload layout, header check |
-| `include/fe_ip.h` | FEIP (Abdalla et al. PKC 2015): setup, encrypt (mpk or msk), key derivation, decryption to `g^<x,y>`, serialization |
-| `include/fe_bo.h` | FEBO (CryptoNN Sec. III-B): '+', '-', '*', '/', serialization |
-| `include/bsgs.h` | bounded discrete log by baby-step giant-step (thread-safe, signed values, exact bounds) |
-| `include/ec_group.h` | P-256 context, RAII `Scalar` / `Point`, compressed encoding with validation, multi-scalar multiplication |
-| `include/net.h` | TCP channel with exact payload byte and flight counters |
-| `include/metrics.h` | per-phase wall / CPU / traffic accounting, peak RSS, byte formatting |
-| `include/lr_reference.h`, `include/lr_params.h` | copies of baseline 1's fixed-point specification and data generator (namespace `lrcn`) |
-| `scripts/` | `build.sh`, `run_local.sh`, `bench_sweep.sh` |
+| `src/lr_cryptonn.cpp` | the program: CLI, reports, JSON / CSV, `--verify` |
+| `include/cryptonn_protocol.h` | the protocol (`run_client`, `run_server`), header, traffic formulas, report blob, worker pool |
+| `src/lr_cryptonn_selftest.cpp` | group / BSGS / FEIP / FEBO tests, and end-to-end runs of the real protocol over loopback TCP |
+| `include/ec_group.h` | P-256 scalars and points (OpenSSL), multi-scalar multiplication |
+| `include/bsgs.h` | bounded discrete log (baby-step giant-step) |
+| `include/fe_ip.h`, `include/fe_bo.h` | FEIP (Abdalla et al.) and FEBO (CryptoNN Sec. III-B) |
+| `include/lr_params.h`, `include/lr_reference.h` | parameters and data generation; the plaintext fixed-point reference (copies of the GC baseline's) |
+| `include/metrics.h`, `include/net.h` | per-phase wall / CPU / bytes / flights; the TCP channel with exact counters |
+
+## Limitations
+
+- Semi-honest only (see above). There is no protection against a server that requests keys for chosen vectors.
+- The client generates the master keys itself, so there is no separate authority process. Merging the roles removes the
+  server ↔ authority hop that CryptoNN has. In the paper's three-party deployment, each key request would cost an
+  extra round trip to the authority.
+- The discrete-log bound is Σ|w_j|·2^f. It is public but loose; actual values are much smaller, and the solve stops at
+  the first hit. With a large `--qbits` and a small `--dlog-bits`, giant steps dominate the server's online time.
+- Values on the wire are int32. The program refuses parameters whose public weight bound would not fit.
