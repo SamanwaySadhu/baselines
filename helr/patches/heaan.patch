@@ -1,0 +1,48 @@
+diff --git a/src/Cipher.h b/src/Cipher.h
+index 83a3042..4a285a6 100644
+--- a/src/Cipher.h
++++ b/src/Cipher.h
+@@ -32,6 +32,12 @@ public:
+ 
+ 	Cipher(const Cipher& o) : ax(o.ax), bx(o.bx), mod(o.mod), cbits(o.cbits), slots(o.slots) {}
+ 
++	// Added for the HELR baseline: without these the user-declared copy constructor
++	// suppresses moves, so every std::move / vector growth deep-copies ~60 MB.
++	Cipher(Cipher&&) = default;
++	Cipher& operator=(const Cipher&) = default;
++	Cipher& operator=(Cipher&&) = default;
++
+ };
+ 
+ #endif /* SCHEME_CIPHER_H_ */
+diff --git a/src/Message.h b/src/Message.h
+index f5f3b73..a610381 100644
+--- a/src/Message.h
++++ b/src/Message.h
+@@ -27,6 +27,10 @@ public:
+ 	Message(ZZX mx = ZZX::zero(), ZZ mod = ZZ::zero(), long cbits = 0, long slots = 1) : mx(mx), mod(mod), cbits(cbits), slots(slots) {}
+ 
+ 	Message(const Message& o) : mx(o.mx), mod(o.mod), cbits(o.cbits), slots(o.slots) {}
++
++	Message(Message&&) = default;  // added for the HELR baseline (see Cipher.h)
++	Message& operator=(const Message&) = default;
++	Message& operator=(Message&&) = default;
+ };
+ 
+ #endif /* SCHEME_MESSAGE_H_ */
+diff --git a/src/PubKey.h b/src/PubKey.h
+index e1cfc82..d496284 100644
+--- a/src/PubKey.h
++++ b/src/PubKey.h
+@@ -30,6 +30,11 @@ public:
+ 
+ 	PubKey(Params& params, SecKey& secretKey);
+ 
++	/// Empty key set; the caller fills in only the keys it needs and allocates the
++	/// rotation arrays (the generating constructor above builds all 2 (logN - 1)
++	/// rotation keys, ~5 GB at logN = 17). Added for the HELR baseline.
++	PubKey() : axLeftRot(nullptr), bxLeftRot(nullptr), axRightRot(nullptr), bxRightRot(nullptr) {}
++
+ 	//-----------------------------------------
+ 
+ };

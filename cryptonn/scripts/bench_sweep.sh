@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Sweep the dimension d (REPS runs each) on localhost; one CSV row per run.
 #   D_LIST="5 10 50 100" REPS=3 OUT=results/sweep.csv scripts/bench_sweep.sh [extra training flags]
-# THREADS=N passes --threads N to both parties. VERIFY=1 (default) makes the server check
+# THREADS=N passes --threads N to both parties. BASE_PORT=P uses ports P, P+1, ... (one
+# per run; default: a random port per run). VERIFY=1 (default) makes the server check
 # every run bit for bit against the plaintext fixed-point reference (the 'verified' CSV
 # column and a PASS/FAIL per run); VERIFY=0 skips it. BUILD_DIR overrides ./build.
 set -uo pipefail
@@ -15,9 +16,11 @@ T=""; [ -n "${THREADS:-}" ] && T="--threads $THREADS"
 V=""; [ "${VERIFY:-1}" = "1" ] && V="--verify"
 mkdir -p results "$(dirname "$OUT")"
 FAILS=0
+RUN=0
 for d in $D_LIST; do
   for r in $(seq 1 "$REPS"); do
-    PORT=$(( 30000 + RANDOM % 20000 ))
+    if [ -n "${BASE_PORT:-}" ]; then PORT=$(( BASE_PORT + RUN )); else PORT=$(( 30000 + RANDOM % 20000 )); fi
+    RUN=$((RUN + 1))
     "$BIN" server --port $PORT --quiet $T $V --d "$d" --csv "$OUT" "$@" > results/sweep_server.log 2>&1 &
     SPID=$!
     "$BIN" client --host 127.0.0.1 --port $PORT --quiet $T --d "$d" "$@" > results/sweep_client.log 2>&1

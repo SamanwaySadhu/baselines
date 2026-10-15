@@ -85,6 +85,16 @@ inline BN_CTX* bn_ctx() {
   return h.c;
 }
 
+// RAII BN_CTX_start / BN_CTX_end frame: the frame is closed even when an OpenSSL
+// failure throws between the two (keeps the thread_local BN_CTX balanced).
+struct BnCtxFrame {
+  BN_CTX* c;
+  explicit BnCtxFrame(BN_CTX* ctx) : c(ctx) { BN_CTX_start(c); }
+  ~BnCtxFrame() { BN_CTX_end(c); }
+  BnCtxFrame(const BnCtxFrame&) = delete;
+  BnCtxFrame& operator=(const BnCtxFrame&) = delete;
+};
+
 // ------------------------------------------------------------------ group
 class EcGroup {
  public:
@@ -484,7 +494,7 @@ inline Point Point::multi_mul(const std::vector<const Point*>& pts,
   std::vector<const EC_POINT*> pts_b;
   std::vector<const BIGNUM*> ks_b;
   BN_CTX* ctx = bn_ctx();
-  BN_CTX_start(ctx);
+  std::optional<BnCtxFrame> frame(std::in_place, ctx);
   BIGNUM* t = BN_CTX_get(ctx);
   if (!t) ossl_fail("BN_CTX_get");
   auto small_value = [&](const BIGNUM* b, int64_t& out) -> bool {
@@ -509,7 +519,7 @@ inline Point Point::multi_mul(const std::vector<const Point*>& pts,
       ks_b.push_back(ks[i]->bn);
     }
   }
-  BN_CTX_end(ctx);
+  frame.reset();  // closes the frame before multi_mul_split uses the same BN_CTX
   return detail::multi_mul_split(pts_s, vs, pts_b, ks_b);
 }
 

@@ -98,7 +98,7 @@ class Dlog {
   void init_generic_group() {
     const auto& G = EcGroup::get();
     BN_CTX* ctx = bn_ctx();
-    BN_CTX_start(ctx);
+    BnCtxFrame frame(ctx);
     BIGNUM* p = BN_CTX_get(ctx);
     BIGNUM* a = BN_CTX_get(ctx);
     BIGNUM* b = BN_CTX_get(ctx);
@@ -123,7 +123,6 @@ class Dlog {
     ossl_check(EC_POINT_set_affine_coordinates(g2_, g2_step_pos_, x, y, ctx), "set_affine(M*g)");
     ossl_check(EC_POINT_copy(g2_step_neg_, g2_step_pos_), "EC_POINT_copy");
     ossl_check(EC_POINT_invert(g2_, g2_step_neg_, ctx), "EC_POINT_invert");
-    BN_CTX_end(ctx);
   }
 
   // Keys of j*g for j in [lo, hi) (lo >= 1) into keys[j].
@@ -132,15 +131,21 @@ class Dlog {
     BN_CTX* ctx = bn_ctx();
     const EC_POINT* g = EC_GROUP_get0_generator(g2_);
     constexpr int kBatch = 512;
-    std::vector<EC_POINT*> batch(kBatch);
+    std::vector<EC_POINT*> batch(kBatch, nullptr);
+    struct Free {
+      std::vector<EC_POINT*>& v;
+      ~Free() {
+        for (auto* p : v) EC_POINT_free(p);
+      }
+    } free_batch{batch};
     for (auto& b : batch)
       if (!(b = EC_POINT_new(g2_))) ossl_fail("EC_POINT_new");
     EcPointPtr cur(EC_POINT_new(g2_), EC_POINT_free);
     if (!cur) ossl_fail("EC_POINT_new");
-    BN_CTX_start(ctx);
+    BnCtxFrame frame(ctx);
     BIGNUM* x = BN_CTX_get(ctx);
     BIGNUM* s = BN_CTX_get(ctx);
-    if (!x) ossl_fail("BN_CTX_get");
+    if (!x || !s) ossl_fail("BN_CTX_get");
     ossl_check(BN_set_word(s, static_cast<BN_ULONG>(lo)), "BN_set_word");
     ossl_check(EC_POINT_mul(g2_, cur.get(), s, nullptr, nullptr, ctx), "EC_POINT_mul");
     for (int64_t j = lo; j < hi; j += kBatch) {
@@ -157,8 +162,6 @@ class Dlog {
         keys[size_t(j + i)] = key_of_x(x);
       }
     }
-    BN_CTX_end(ctx);
-    for (auto* b : batch) EC_POINT_free(b);
   }
 
   void build(int threads) {
@@ -205,15 +208,17 @@ class Dlog {
       if (keys_[s] != key) continue;
       const int64_t j = vals_[s];
       const Point C = Point::gen_mul_i64(j);
-      BN_CTX_start(ctx);
-      BIGNUM* xc = BN_CTX_get(ctx);
-      BIGNUM* yc = BN_CTX_get(ctx);
-      if (!yc) ossl_fail("BN_CTX_get");
-      ossl_check(EC_POINT_get_affine_coordinates(EcGroup::get().group(), C.p, xc, yc, ctx),
-                 "get_affine");
-      const bool hit = BN_cmp(xc, x) == 0;
-      const bool same_sign = BN_is_odd(yc) == BN_is_odd(y);
-      BN_CTX_end(ctx);
+      bool hit, same_sign;
+      {
+        BnCtxFrame frame(ctx);
+        BIGNUM* xc = BN_CTX_get(ctx);
+        BIGNUM* yc = BN_CTX_get(ctx);
+        if (!yc) ossl_fail("BN_CTX_get");
+        ossl_check(EC_POINT_get_affine_coordinates(EcGroup::get().group(), C.p, xc, yc, ctx),
+                   "get_affine");
+        hit = BN_cmp(xc, x) == 0;
+        same_sign = BN_is_odd(yc) == BN_is_odd(y);
+      }
       if (hit) return same_sign ? j : -j;
     }
     return std::nullopt;
@@ -238,11 +243,7 @@ inline std::optional<int64_t> Dlog::solve(const Point& P, int64_t bound) const {
   };
   if (P.is_identity()) return 0;
   BN_CTX* ctx = bn_ctx();
-  BN_CTX_start(ctx);
-  struct CtxEnd {
-    BN_CTX* c;
-    ~CtxEnd() { BN_CTX_end(c); }
-  } ctx_end{ctx};
+  BnCtxFrame frame(ctx);
   BIGNUM* x = BN_CTX_get(ctx);
   BIGNUM* y = BN_CTX_get(ctx);
   if (!y) ossl_fail("BN_CTX_get");
