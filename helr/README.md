@@ -142,7 +142,34 @@ exchange their numbers at the end.
 - The client's online time is dominated by waiting for the server's evaluation; its own online compute is decrypt + check + re-derive (reported separately).
 - Bytes are payload bytes (no TCP/IP headers) and equal the analytic formulas (`comm_layout`); the run prints `[measured == analytic]`.
 
-RESULTS_PLACEHOLDER
+## Results
+
+This laptop: Intel Core 7 150U (2 performance + 8 efficiency cores), WSL2 Ubuntu 24.04 with 7 GB RAM, localhost, NTL 11.5.1, OpenSSL 3.0.13.
+Defaults: N = 2^17, log q = 1766, degree 3, R = 8, 20 iterations, batch 4, 2 threads per party. One run, `--verify` passed.
+
+| d | 2 |
+|---|---|
+| client preprocessing (offline) | 31.3 s wall / 44.8 s cpu (HE context 8.3, keygen 11.6, encryption 4.8, upload 6.5) |
+| server preprocessing (offline) | 39.6 s wall / 15.6 s cpu (HE context 8.4, receive + deserialize 31.1) |
+| server online computation | 1918 s wall / 3894 s cpu (HE evaluation 1913 s, MAC + output 5 s) |
+| client online computation | 2.8 s own compute (decrypt, check, re-derive c2); 1916 s waiting for the server |
+| communication, offline | client->server 1.11 GiB (keys 912 MiB, data 110.5 MiB, w0 110.5 MiB), server->client 64 B |
+| communication, online | server->client 11.0 MiB (c1, c2 for 2 weights), client->server 108 B |
+| communication, total | 1.12 GiB (1,199,178,060 B), measured == analytic |
+| rounds | 4 offline flights (coin toss 3, upload 1) + 4 online flights (2 round trips); the evaluation is non-interactive |
+| peak RSS client / server | 1.9 GiB / 3.8 GiB |
+| accuracy | max abs deviation of the HE weights from the plaintext polynomial training 1.0e-4 (client tolerance 3.9e-3); 0.21 from exact-sigmoid training |
+
+Where the server's evaluation time goes (thread-seconds, 2 threads): rotations 2031 s (280 x 7.3 s), multiplications 1304 s
+(120 x 10.9 s), squares 171 s, plaintext masks 77 s. Iterations take 152 s at the top modulus and 59 s at the end.
+
+**Scaling with d (model, not measured).** Cost is linear in d: each feature costs ~1800 CPU-seconds (3 multiplications and 7
+rotations per iteration), plus a serial ~170 s, so `server evaluation wall ~ (1800 d + 170) / threads` seconds; communication is
+`~ 0.91 GiB + 0.11 GiB x d` (keys + 2 x 55 MiB per feature) offline and `5.5 MiB x d` online. Memory is ~1 GB of keys plus
+~110 MiB per feature plus ~1 GB per concurrent multiplication, so d = 5 fits this laptop (~4 GB per party) and d >= 20 needs a larger machine; only d = 2 was run here.
+`scripts/bench_sweep.sh` measures other d.
+
+The report ends with a SUMMARY block (preprocessing, online computation, total communication per party).
 
 ## Files
 
