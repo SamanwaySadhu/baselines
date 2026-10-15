@@ -92,8 +92,8 @@ void usage(const char* prog) {
       "  --host IP        server address the client connects to (default 127.0.0.1)\n"
       "  --port N         TCP port; the server listens on it (default 23456)\n"
       "  --threads N      threads per party: key generation, encryption, and the per-feature part\n"
-      "                   of every iteration (default 1). Each concurrent homomorphic multiplication\n"
-      "                   needs ~1 GB at N = 2^17.\n"
+      "                   of every iteration (default 0 = all cores, limited so that ~1 GB per thread\n"
+      "                   at N = 2^17 fits in 70%% of available memory).\n"
       "  --tol X          client: abort unless the decrypted weights are within X of its own plaintext\n"
       "                   run of the same training (default 2^-8 = 0.0039)\n\n"
       "output:\n"
@@ -143,7 +143,7 @@ Options parse_options(int argc, char** argv) {
     else throw std::invalid_argument("unknown option " + a);
   }
   if (O.port < 1 || O.port > 65535) throw std::invalid_argument("--port out of range");
-  if (O.H.threads < 1 || O.H.threads > 256) throw std::invalid_argument("--threads must be in [1, 256]");
+  if (O.H.threads < 0 || O.H.threads > 256) throw std::invalid_argument("--threads must be in [0, 256] (0 = automatic)");
   if (!(O.tol > 0)) throw std::invalid_argument("--tol must be > 0");
   O.P.finalize();
   const std::string t = O.tamper;
@@ -390,6 +390,7 @@ int main(int argc, char** argv) {
   lrhe::HeConfig C;
   try {
     C = lrhe::make_he_config(P, O.H);
+    if (O.H.threads == 0) O.H.threads = lrhe::auto_threads(C.N());
   } catch (const std::exception& e) {
     std::fprintf(stderr, "error: %s\n", e.what());
     return 2;

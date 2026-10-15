@@ -34,6 +34,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <exception>
 #include <memory>
@@ -97,6 +98,28 @@ void parallel_for(int n, int threads, F&& f) {
   if (err) std::rethrow_exception(err);
 }
 
+// Threads to use when --threads is 0: every core, but not more than fit in memory. A concurrent
+// homomorphic multiplication needs ~1 GiB at N = 2^17 (proportionally less/more for other N);
+// 70% of MemAvailable is the budget. Capped at 256 (the --threads maximum).
+inline int auto_threads(long N) {
+  int n = (int)std::thread::hardware_concurrency();
+  if (n < 1) n = 1;
+  n = std::min(n, 256);
+  if (FILE* f = std::fopen("/proc/meminfo", "r")) {
+    char line[256];
+    long long kb = -1;
+    while (std::fgets(line, sizeof line, f))
+      if (std::sscanf(line, "MemAvailable: %lld kB", &kb) == 1) break;
+    std::fclose(f);
+    if (kb > 0) {
+      const double per_thread = 1073741824.0 * (double)N / (double)(1L << 17);
+      const double fit = 0.7 * (double)kb * 1024.0 / std::max(per_thread, 1.0);
+      n = std::max(1, std::min(n, (int)fit));
+    }
+  }
+  return n;
+}
+
 // --------------------------------------------------------------------- config
 // Everything both parties must agree on (the client sends it in the upload header, the
 // server recomputes it from its own flags and compares).
@@ -140,7 +163,7 @@ struct HeOptions {
   int mac_bits = 48;
   int lambda = 128;
   int logR = -1;       // -1 = automatic from d (see auto_logR)
-  int threads = 1;
+  int threads = 0;     // 0 = automatic: all cores, limited by memory (see auto_threads)
   bool insecure_ok = false;  // allow a logN below the target (tests only)
 };
 
