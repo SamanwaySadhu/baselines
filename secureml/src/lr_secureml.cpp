@@ -172,7 +172,12 @@ int main(int argc, char** argv) {
     // ---- setup: agree on parameters, bring up the OT-extension sessions of every worker --------------
     {
       Scope sc(rec, "setup/handshake");
-      Handshake h{P.d, P.iters, P.batch, P.frac, P.qbits, P.ssp, lk.nw(), mal ? 1 : 0, P.lr, P.bias ? 1 : 0}, g{};
+      // zero the whole struct first: the tail padding is otherwise indeterminate and would break the memcmp below
+      Handshake h, g;
+      std::memset(&h, 0, sizeof h);
+      std::memset(&g, 0, sizeof g);
+      h.d = P.d; h.iters = P.iters; h.batch = P.batch; h.frac = P.frac; h.qbits = P.qbits; h.ssp = P.ssp;
+      h.threads = lk.nw(); h.mal = mal ? 1 : 0; h.lr = P.lr; h.bias = P.bias ? 1 : 0;
       M.swap(&h, &g, sizeof h);
       if (std::memcmp(&h, &g, sizeof h) != 0) throw AbortError("the parties were started with different parameters (d, iters, batch, frac, qbits, ssp, lr, bias, threads, mode)");
     }
