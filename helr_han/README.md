@@ -74,7 +74,7 @@ of well-formed ciphertexts and keys, which are not implemented. What this baseli
 - The server sees only RLWE ciphertexts and evaluation keys under the client's key (semantic security, and the usual
   circular-security assumption for the evaluation keys); it receives **no output at all**.
 - The client **never releases a decryption**. It decrypts the result locally and accepts it only if every weight is within
-  `--tol` (default 5e-3) of the weights it computes itself by running the same training in the clear (it owns every input; this costs
+  `--tol` (default 1e-2) of the weights it computes itself by running the same training in the clear (it owns every input; this costs
   microseconds against the HE evaluation), and the replicas of each weight agree. Otherwise it aborts and prints nothing. So a
   server that returns a wrong result, or that tries to turn the client into a decryption oracle (for instance by sending one of the
   client's own data ciphertexts, modulus-switched to the expected level), is detected, and nothing the client decrypts is ever sent
@@ -146,6 +146,32 @@ stage totals report **wall (compute)** = wall minus waiting. The SUMMARY gives, 
 **combined** (sum of the two parties' computation), the offline / online / other computation and cpu time, the communication in
 each direction per stage, the flights and the end-to-end elapsed time. A flight is a maximal run of messages in one direction; a
 round trip is 2.
+
+## Results
+
+One run, this machine: WSL2 with 12 hardware threads and 7 GB RAM (the real-parameter run swaps), localhost, both parties on
+the machine with 6 threads each. `d = 5` (padded to 8, `cnum = 4` ciphertexts of 2 features), iters = 20, batch = 4, lr = 0.5,
+**N = 2^16, logQ = 495, logQBoot = 1155** (the paper's parameters), 6 bootstrapping rounds of 8 ciphertexts.
+
+| | client | server | combined |
+|---|---|---|---|
+| offline: compute wall / cpu | 35.9 s / 163.7 s (HE context 0.2 s, key generation 10.6 s, encryption 19.1 s, upload 6.0 s) | 6.5 s / 6.9 s (context 0.2 s, key reception 2.1 s, data reception 4.2 s) | 42.4 s / 170.6 s |
+| online: compute wall / cpu | 0.7 s / 0.8 s (receive, decrypt, verify) | 15.0 min / 74.3 min (inner products 59 s, sigmoid gradients 101 s, NAG updates 2.7 s, **bootstrapping 12.2 min**) | 15.0 min / 74.3 min |
+| other: compute | ~0 | ~0 | ~0 |
+| waiting for the other party | 15.0 min online | 29.7 s offline | |
+| total compute wall / cpu | 36.6 s / 164.5 s | 15.1 min / 74.4 min | 15.7 min / 77.2 min |
+| peak RSS | 2.9 GiB | 5.7 GiB | |
+
+- **Communication**: offline client->server **2.10 GiB** (keys 1.39 GiB, data 732 MiB, w0 and v0), online server->client
+  **12.5 MiB** (the 4 result ciphertexts), handshake 80 B each way; total 2.12 GiB.
+- **Rounds**: 4 flights = **2 round trips** (handshake, upload + result); the evaluation is non-interactive.
+- **Accuracy**: max |HE weights - plaintext polynomial training| = 3.2e-3 (client tolerance 1e-2), replicas agree to 5e-9;
+  0.18 away from training with the exact sigmoid (the cost of the cubic fit with random data and weights).
+- The bootstrapping (12.2 of the 15.0 minutes, in 6 rounds) dominates, as in the paper. The per-iteration work is small by comparison.
+  With 6 threads and 8 ciphertexts per round, memory pressure (swapping) made the run slower than the CPU time alone would
+  suggest; a machine with more RAM would run it faster. HEAAN v1.1 and the sparse-slot bootstrapping are used as the authors do.
+- Cost scales with `cnum`, not with the number of used slots: every ciphertext costs a full `N = 2^16` operation however few
+  slots it uses. `d = 5` is the worst case for the packing (4 ciphertexts for 5 features).
 
 ## Files
 

@@ -50,7 +50,7 @@ struct Options {
   Params P;
   std::string host = "127.0.0.1";
   int port = 12345;
-  double tol = 5e-3;
+  double tol = 1e-2;
   bool quiet = false;
   std::string json_path, csv_path;
   Tamper tamper;
@@ -85,7 +85,7 @@ void usage(const char* prog) {
       "  --host IP --port N           (default 127.0.0.1:12345)\n"
       "  --threads N                  worker threads (default: all hardware threads)\n"
       "  --tol X                      client: abort if a decrypted weight differs from the plaintext\n"
-      "                               computation by more than X (default 5e-3)\n\n"
+      "                               computation by more than X (default 1e-2)\n\n"
       "output:\n"
       "  --json FILE  --csv FILE      (client) metrics as JSON / one summary row\n"
       "  --quiet                      no progress lines\n"

@@ -9,14 +9,15 @@ BIN=build/lr_helr_han
 mkdir -p results
 COMMON="--d 5 --iters 4 --logn 12 --threads 4 --quiet"
 fail=0
+EXTRA=("$@")
 run_case() {  # <tamper-role> <kind> <detector-role> <expected message fragment>
   local role=$1 kind=$2 det=$3 frag=$4
   local PORT=$(( (RANDOM % 15000) + 20000 )) S="" C=""
   [ "$role" = server ] && S="--tamper $kind"
   [ "$role" = client ] && C="--tamper $kind"
-  "$BIN" server --port "$PORT" $COMMON $S "$@" > results/t_server.log 2>&1 &
+  "$BIN" server --port "$PORT" $COMMON $S "${EXTRA[@]}" > results/t_server.log 2>&1 &
   local SPID=$!
-  "$BIN" client --port "$PORT" $COMMON $C "$@" > results/t_client.log 2>&1
+  "$BIN" client --port "$PORT" $COMMON $C "${EXTRA[@]}" > results/t_client.log 2>&1
   local CRC=$?
   wait "$SPID"; local SRC=$?
   local drc=$CRC dlog=results/t_client.log
@@ -28,13 +29,12 @@ run_case() {  # <tamper-role> <kind> <detector-role> <expected message fragment>
     fail=1
   fi
 }
-shift 0
-run_case server result       client "differ from the client's own plaintext training" "$@"
-run_case server oracle       client "differ from the client's own plaintext training" "$@"
-run_case server level        client "unexpected shape or level" "$@"
-run_case client range        server "coefficient out of range" "$@"
-run_case client shape        server "unexpected shape or level" "$@"
-run_case client key          server "unreduced residues" "$@"
-run_case client missing-key  server "wrong number of evaluation keys" "$@"
+run_case server result       client "differ from the client's own plaintext training"
+run_case server oracle       client "differ from the client's own plaintext training"
+run_case server level        client "unexpected shape or level"
+run_case client range        server "coefficient out of range"
+run_case client shape        server "unexpected shape or level"
+run_case client key          server "unreduced residues"
+run_case client missing-key  server "wrong number of evaluation keys"
 [ "$fail" = 0 ] && echo "tamper test: PASS (every deviation was detected)" || echo "tamper test: FAIL"
 exit $fail
