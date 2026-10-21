@@ -1,23 +1,22 @@
-// lr_reference.h -- plaintext specification of the float32 logistic-regression
-// training that the garbled circuit computes, bit for bit.
+// lr_reference.h -- plaintext specification of the quantized logistic-regression
+// training that the garbled circuit computes, plus the sigmoid threshold table.
 //
-// One iteration t on its batch {(x_i, y_i)}, i < 4, all binary32 (IEEE round-to-nearest-even,
-// NO fused multiply-add: this file must be compiled with -ffp-contract=off, which
-// CMakeLists.txt sets, because the circuit's multiply-add is an unfused mul + add):
-//   z_i    = ((w_0 x_i0 + w_1 x_i1) + ...) + w_bias        (bias feature = 1.0f)
-//   yhat_i = sigmoid(z_i) = 1 / (1 + exp(-z_i))
-//   e_i    = yhat_i - y_i
-//   g_j    = ((e_0 x_0j + e_1 x_1j) + ...)   (g_bias = ((e_0 + e_1) + e_2) + e_3)
-//   w_j   <- w_j + g_j * (-lr/batch)                         lr = 0.01, batch = 4
+// All values are integers; a value v at scale 2^s stands for v / 2^s. Inputs are
+// qbits-bit quantized values at scale 2^f, f = qbits - 1 (qbits = 6: [-32, 31] / 32).
+// Every dot product of two scale-2^f vectors has scale 2^(2f) and is TRUNCATED back
+// to scale 2^f right away, by an arithmetic shift right by f (floor(v / 2^f)). The
+// shift keeps the integer bits (no clamping to qbits bits; widths grow as needed, and
+// nothing ever wraps around).
 //
-// This is exact logistic regression: the sigmoid is the true function, with exp()
-// evaluated by Cody-Waite range reduction (exp(-a) = 2^-n * exp(-r), |r| <= ln2/2)
-// and a degree-7 Taylor polynomial (relative error ~5e-9 < one float32 ulp), not a
-// piecewise-linear / low-degree approximation of the sigmoid. sigmoid is evaluated
-// on |z| (t = exp(-|z|) lies in (0, 1], so nothing overflows) and |z| is saturated at
-// 87, where exp(-87) = 1.6e-38 is still a normal float32; the sigmoid saturates
-// to 1 (z > 0) and to <= 1.6e-38 (z < 0), which differs from the true value by less
-// than 1.6e-38.
+// One iteration t on its batch {(x_i, y_i)}, i < batch:
+//   z_i    = trunc_f( sum_j w_j * x_ij )                 dot product, then truncation
+//   yhat_i = min( floor(2^f * sigmoid(z_i / 2^f)), MAXQ ) exact sigmoid, qbits-bit output
+//   e_i    = yhat_i - MAXQ * y_i
+//   g_j    = trunc_f( sum_i e_i * x_ij )                 dot product, then truncation
+//   w_j   <- trunc0( (K*w_j - g_j) / K ),  K = batch / lr  (lr/batch folded in, as the FE code)
+// with trunc_f(v) = floor(v / 2^f) = v >> f, and trunc0 = rounding toward zero (C's '/').
+// The update is that of the FE code (backward_prop_kim.cpp: w_scaled = (B/LR)*w,
+// w' = (int)((w_scaled - (output_value >> (QB-1))) * LR / B)).
 #ifndef LRGC_REFERENCE_H
 #define LRGC_REFERENCE_H
 
@@ -26,93 +25,111 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <limits>
+#include <stdexcept>
 #include <vector>
 
 namespace lrgc {
 
-// Constants shared with the circuit.
-constexpr float kLog2e = 1.44269504088896340736f;
-constexpr float kLn2Hi = 6.9313812256e-01f;   // fdlibm: low 7 bits zero -> n * kLn2Hi exact for n < 128
-constexpr float kLn2Lo = 9.0580006145e-06f;
-constexpr float kMagic = 12582912.0f;         // 1.5 * 2^23: adding it rounds to the nearest integer
-constexpr float kExpClamp = 87.0f;
-constexpr int kPolyDegree = 7;
-// 1/k! rounded to float32, k = 0..7
-constexpr float kInvFact[kPolyDegree + 1] = {1.0f, 1.0f, 0.5f, 0.16666666666666666f, 0.041666666666666664f,
-                                             0.008333333333333333f, 0.001388888888888889f,
-                                             0.0001984126984126984f};
-
-// sigmoid(z) in float32, operation for operation what the circuit does.
-inline float sigmoid_f32(float z) {
-  const bool neg = (f2u(z) >> 31) != 0;
-  const float a = std::min(u2f(f2u(z) & 0x7FFFFFFFu), kExpClamp);
-  const float u = a * kLog2e;
-  const float r1 = u + kMagic;
-  const float nf = r1 - kMagic;
-  const uint32_t n = f2u(r1) & 0x7Fu;  // round(u) in [0, 126]
-  float r = a - nf * kLn2Hi;
-  r = r - nf * kLn2Lo;
-  const float s = -r;
-  float p = kInvFact[kPolyDegree];
-  for (int k = kPolyDegree - 1; k >= 0; --k) p = p * s + kInvFact[k];  // unfused: mul, then add
-  const float pw = u2f((127u - n) << 23);                               // 2^-n
-  const float t = p * pw;                                               // exp(-a)
-  const float den = t + 1.0f;
-  const float num = neg ? t : 1.0f;
-  return num / den;
-}
-
-// The true sigmoid in long double, for accuracy checks.
 inline long double sigmoid_ld(long double x) { return 1.0L / (1.0L + std::exp(-x)); }
 
-struct RefTrace {
-  std::vector<std::vector<float>> w_after;  // weights after each iteration
+// Truncation after a dot product: scale 2^(2f) -> 2^f, floor (C++20 >> on signed
+// values rounds toward -infinity).
+inline int64_t trunc_f(int64_t v, int f) { return v >> f; }
+
+// sum_j a_j * b_j, exact (scale 2^(2f) for two scale-2^f vectors).
+inline int64_t dot_exact(const std::vector<int64_t>& a, const std::vector<int64_t>& b) {
+  int64_t s = 0;
+  for (size_t j = 0; j < a.size(); ++j) s += a[j] * b[j];
+  return s;
+}
+
+// yhat = min(floor(2^f * sigmoid(z / 2^f)), 2^f - 1) for z at scale 2^f, evaluated
+// in long double like the FE code's non_linear_transform. The clamp only matters when
+// sigmoid rounds to 1.0L, which keeps yhat in [0, MAXQ].
+inline int64_t qsigmoid_ref(int64_t z, int f) {
+  const long double scale = std::ldexp(1.0L, f);
+  const int64_t v = (int64_t)(sigmoid_ld((long double)z / scale) * scale);
+  return std::min<int64_t>(v, (int64_t(1) << f) - 1);
+}
+
+// thresholds t[v] = min{ z : qsigmoid_ref(z) >= v } for v = 1..MAXQ (t[0] unused),
+// found by an exhaustive scan of the transition window (which also verifies that
+// qsigmoid_ref is monotone there and constant outside it).
+struct SigmoidTable {
+  int f = 0;
+  int64_t maxq = 0;
+  std::vector<int64_t> t;
 };
 
-inline std::vector<float> reference_train(const Params& P, const Dataset& D, std::vector<float> w,
-                                          RefTrace* tr = nullptr) {
-  const int dd = P.d_data();
+inline SigmoidTable make_sigmoid_table(int f) {
+  SigmoidTable S;
+  S.f = f;
+  S.maxq = (int64_t(1) << f) - 1;
+  // yhat >= 1 iff z / 2^f >= -ln(MAXQ) (about); yhat >= MAXQ iff z / 2^f >= ln(MAXQ).
+  const long double span = std::log((long double)S.maxq) * std::ldexp(1.0L, f);
+  const int64_t zlo = (int64_t)std::floor(-span) - 8, zhi = (int64_t)std::ceil(span) + 8;
+  if (qsigmoid_ref(zlo, f) != 0 || qsigmoid_ref(zhi, f) != S.maxq)
+    throw std::runtime_error("sigmoid table: scan window does not cover the transitions");
+  S.t.assign((size_t)S.maxq + 1, 0);
+  int64_t prev = 0;
+  for (int64_t z = zlo; z <= zhi; ++z) {
+    const int64_t q = qsigmoid_ref(z, f);
+    if (q < prev) throw std::runtime_error("sigmoid table: quantized sigmoid is not monotone");
+    while (prev < q) S.t[(size_t)++prev] = z;
+  }
+  if (prev != S.maxq) throw std::runtime_error("sigmoid table: incomplete");
+  return S;
+}
+
+// The same function via the thresholds (what the circuit evaluates).
+inline int64_t qsigmoid_by_table(const SigmoidTable& S, int64_t z) {
+  int64_t v = 0;
+  while (v < S.maxq && z >= S.t[(size_t)v + 1]) ++v;
+  return v;
+}
+
+struct RefTrace {
+  std::vector<std::vector<int64_t>> w_after;  // weights after each iteration
+  int64_t z_min = std::numeric_limits<int64_t>::max();  // truncated z (scale 2^f)
+  int64_t z_max = std::numeric_limits<int64_t>::min();
+};
+
+inline std::vector<int64_t> reference_train(const Params& P, const Dataset& D,
+                                            std::vector<int64_t> w, RefTrace* tr = nullptr) {
+  const int64_t K = int64_t(1) << P.k_shift;
+  std::vector<int64_t> e((size_t)P.batch);
   for (int t = 0; t < P.iters; ++t) {
-    float e[kBatch];
-    for (int i = 0; i < kBatch; ++i) {
-      float z = w[0] * D.X(t, i, 0);
-      for (int j = 1; j < dd; ++j) z = w[j] * D.X(t, i, j) + z;
-      z = z + w[dd];
-      e[i] = sigmoid_f32(z) - (D.Y(t, i) ? 1.0f : 0.0f);
+    for (int i = 0; i < P.batch; ++i) {
+      int64_t zfull = 0;
+      for (int j = 0; j < P.d; ++j) zfull += w[j] * D.X(t, i, j);
+      const int64_t z = trunc_f(zfull, P.f);
+      if (tr) { tr->z_min = std::min(tr->z_min, z); tr->z_max = std::max(tr->z_max, z); }
+      e[i] = qsigmoid_ref(z, P.f) - P.maxq * D.Y(t, i);
     }
     for (int j = 0; j < P.d; ++j) {
-      float g;
-      if (j < dd) {
-        g = e[0] * D.X(t, 0, j);
-        for (int i = 1; i < kBatch; ++i) g = e[i] * D.X(t, i, j) + g;
-      } else {
-        g = e[0] + e[1];
-        for (int i = 2; i < kBatch; ++i) g = g + e[i];
-      }
-      w[j] = g * (-kLrOverBatch) + w[j];
+      int64_t gfull = 0;
+      for (int i = 0; i < P.batch; ++i) gfull += e[i] * D.X(t, i, j);
+      const int64_t g = trunc_f(gfull, P.f);
+      w[j] = (K * w[j] - g) / K;  // C++ '/' truncates toward zero
     }
     if (tr) tr->w_after.push_back(w);
   }
   return w;
 }
 
-// The same training in double precision with the true exp (for reporting how far the
-// float32 result is from infinitely-precise logistic regression).
-inline std::vector<double> reference_train_double(const Params& P, const Dataset& D, std::vector<double> w) {
-  for (int t = 0; t < P.iters; ++t) {
-    double e[kBatch];
-    for (int i = 0; i < kBatch; ++i) {
-      long double z = 0;
-      for (int j = 0; j < P.d; ++j) z += (long double)w[j] * D.X(t, i, j);
-      e[i] = (double)sigmoid_ld(z) - (D.Y(t, i) ? 1.0 : 0.0);
-    }
-    for (int j = 0; j < P.d; ++j) {
-      double g = 0;
-      for (int i = 0; i < kBatch; ++i) g += e[i] * D.X(t, i, j);
-      w[j] -= (double)kLrOverBatch * g;
-    }
+
+// Plaintext accuracy of weights w on a whole dataset: predict 1 iff sigmoid(w . x) >= 0.5,
+// i.e. iff the (untruncated) dot product is >= 0.
+inline double accuracy(const Params& P, const RealData& R, const std::vector<int64_t>& w, int* correct = nullptr) {
+  int ok = 0;
+  for (int i = 0; i < R.n; ++i) {
+    int64_t s = 0;
+    for (int j = 0; j < P.d; ++j) s += w[j] * R.x[(size_t)i * P.d + j];
+    ok += ((s >= 0 ? 1 : 0) == R.y[(size_t)i]);
   }
-  return w;
+  if (correct) *correct = ok;
+  return 100.0 * ok / R.n;
 }
 
 }  // namespace lrgc

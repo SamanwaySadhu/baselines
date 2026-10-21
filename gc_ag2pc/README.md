@@ -22,39 +22,54 @@ inputs travel masked, and OT is used to generate the masks and every authenticat
 > `scripts/check_input_privacy.sh` checks that the client's inputs never appear in its traffic. Results produced before the
 > fix (for example an old `results/sweep.csv`) came from the leaky library. Their timings are about the same, but they were not private.
 
-Everything except the dimension is fixed: **float32** data and weights, **batch = 4**, **learning rate = 0.01**.
-The options are `--d` (features, including the bias column), `--iters` (default 20) and `--seed`.
+The circuit uses the fixed-point semantics of the FE code: **6 quantization bits** (`QUANTIZATION_BITS=6`),
+**batch = 4**, **learning rate = 0.5**, and the bias as the last feature with `x = MAXQ`. `--d` sets the number of features
+(including the bias column) and `--iters` the SGD iterations (default 20). `--qbits`, `--batch`, `--lr`, `--no-bias`,
+`--zero-init` and `--seed` change the rest.
 
 ## What is computed
 
-Exact logistic regression in IEEE binary32. Each iteration, on a batch of 4 datapoints (the bias is the constant feature `1.0f`):
+Every input (feature, initial weight) is a **qbits-bit signed integer** in `[MINQ, MAXQ] = [-32, 31]` that stands for
+`v / 2^f`, `f = qbits - 1 = 5`, so the values are in `[-1, 31/32]`. Labels are `y in {0, 1}` with the label value
+`MAXQ * y`. With `K = batch / lr = 8`, each iteration on its batch of 4 datapoints does:
 
 ```
-z_i    = ((w_0 x_i0 + w_1 x_i1) + ...) + w_bias
-yhat_i = 1 / (1 + exp(-z_i))
-e_i    = yhat_i - y_i                     y_i in {0.0f, 1.0f}
-g_j    = ((e_0 x_0j + e_1 x_1j) + ...)
-w_j    = w_j - g_j * (lr / batch)         lr / batch = 0.01 / 4
+z_i    = trunc_f( sum_j w_j x_ij )                     dot product (scale 2^10), truncated to scale 2^5
+yhat_i = min( floor(2^f * sigmoid(z_i / 2^f)), MAXQ )  exact sigmoid, 6-bit output
+e_i    = yhat_i - MAXQ * y_i
+g_j    = trunc_f( sum_i e_i x_ij )                     dot product (scale 2^10), truncated to scale 2^5
+w_j    = trunc0( (K * w_j - g_j) / K )                 the update of backward_prop_kim.cpp
 ```
 
-- **The sigmoid is the real sigmoid**, not a piecewise or low-degree approximation. `exp(-|z|)` is computed by
-  Cody-Waite range reduction (`2^-n * exp(-r)`, `|r| <= ln2/2`) and a degree-7 polynomial, so it is accurate to about
-  one float32 ulp (the self-test measures at most 2.1 ulp of the final sigmoid over all inputs). It works on `|z|`,
-  so nothing overflows, and saturates at `|z| = 87` (the sigmoid then differs from the true value by less than 1.6e-38).
-- The circuit uses emp-tool's IEEE binary32 add, sub, mul, div and min circuits, which are bit-exact against host floats.
-  emp-tool's `fma` is **unfused** (mul, then add), and the reference does the same, so the secure result equals
-  the plaintext float reference in `include/lr_reference.h` **bit for bit**. The reference must be compiled with
-  `-ffp-contract=off`, which `CMakeLists.txt` sets.
-- This is checked by `lr_gc_selftest` and by `--verify` on a real run, which also prints the distance to a
-  double-precision, true-`exp` run (about 5e-8 for the default size).
+- **Truncation after every dot product.** A product of two scale-2^5 values has scale 2^10. Each dot product is computed
+  exactly and then truncated back to scale 2^5 by an arithmetic shift right by `f = 5`: `trunc_f(v) = v >> 5 = floor(v / 32)`
+  (floor, also for negative values). The shift drops the low 5 bits and costs no gates. `lr_gc_dot_sigmoid` shows this for
+  one dot product, product by product.
+- **"Truncate to 6 bits" means the scale, not the width.** The shift keeps the integer bits: there is no clamping to
+  `[-32, 31]` and nothing wraps around. `z` can exceed the 6-bit range (for example `z = 240` for d = 8 with all inputs 31),
+  and the weights grow over training (about 7 bits after one iteration and 10 bits after 20 at d = 5). Every value carries
+  its exact range, and each operation uses the minimal width that holds it.
+- **The update has one more rounding.** `(K * w_j - g_j) / K` rounds **toward zero** (C's `/`), as the FE code does, so
+  `lr / batch = 1/8` is applied exactly up to that one rounding. `K` must be a power of two.
+- **The sigmoid is exact** (no approximation): `yhat` is the true sigmoid of `z / 2^5`, floored to 6 bits, and clamped to
+  `MAXQ` only where the sigmoid rounds to 1. The circuit finds it by binary search over the 31 public thresholds
+  `t[v] = ceil(32 * ln(v / (32 - v)))` (`yhat >= v` iff `z >= t[v]`): 5 comparisons plus a few ANDs for the one-hot
+  prefix lookup, 47 to 58 ANDs per sigmoid at d = 5.
+- The arithmetic is exact, so the secure result equals the plaintext reference `reference_train` in `include/lr_reference.h`
+  **bit for bit**. This is checked by `lr_gc_selftest` and by `--verify` on a real run, which also prints the distance to
+  unquantized double-precision SGD on the same inputs.
 
-AND gates (iters = 20, batch = 4), from `lr_gc_selftest`. A run needs about `iters × (170K + 29.7K·d)` ANDs:
+The circuit is sized for a fair baseline: constants are folded (the bias column and the shifts by `K` cost nothing),
+products use schoolbook multiplication over the operand with fewer secret bits, and constant multiples use CSD recoding.
 
-| d | 2 | 5 | 10 | 20 | 50 |
-|---|---|---|---|---|---|
-| ANDs | 4.58M | 6.36M | 9.33M | 15.3M | 33.1M |
+AND gates (iters = 20, batch = 4, qbits = 6), from `lr_gc_selftest`. A run needs about `iters x 800 x d` ANDs for large d:
 
-Floating point is expensive in a boolean circuit: one sigmoid costs about 50K ANDs, one float multiply 2.3K, one add 1.1K, one divide 7.8K.
+| d | 2 | 5 | 10 | 20 | 50 | 100 | 200 | 500 | 1000 |
+|---|---|---|---|---|---|---|---|---|---|
+| ANDs | 23.1K | 71.5K | 152K | 312K | 794K | 1.60M | 3.20M | 8.01M | 16.0M |
+
+The float32 version of this baseline (IEEE binary32 with a polynomial sigmoid, 40 to 90 times as many ANDs) is in the git
+history.
 
 ## Why emp-ag2pc
 
@@ -87,11 +102,17 @@ bash scripts/install_emp.sh
 # 3. build the baseline
 EMP_PREFIX=$HOME/emp bash scripts/build.sh
 
-# 4. offline correctness tests + gate counts (--quick: ~10 s; full: ~2.5 min, 11M checks)
+# 4. offline correctness tests + gate counts (--quick: ~1 s; full: ~15 s, 8.3M checks)
 ./build/lr_gc_selftest --quick
 
 # 5. run both parties locally, with the server checking the result (test-only)
 bash scripts/run_local.sh --d 5
+
+# 6. small circuit: one dot product, its truncation and one sigmoid, checked bit for bit
+./build/lr_gc_dot_sigmoid local --d 8                      # emp::ClearCtx + 2000 random vectors
+./build/lr_gc_dot_sigmoid server --d 8 & ./build/lr_gc_dot_sigmoid client --d 8   # over AG2PC
+#    explicit inputs are integers in [-32, 31] (value * 32): --w -32,17,5 --x 31,-9,30
+#    (pass the same flags to both parties)
 ```
 
 **Why the EMP versions are pinned** (`install_emp.sh` handles this):
@@ -110,13 +131,14 @@ the client as two processes on this machine, talking over localhost:
 ```
 
 Both parties must pass the same training flags. The options are:
-- training: `--d --iters --seed` (batch 4, lr 0.01 and float32 are fixed)
+- training: `--d --iters --seed`, and `--qbits` (6), `--batch` (4), `--lr` (0.5; `batch / lr` must be a power of two),
+  `--no-bias`, `--zero-init`
 - protocol: `--threads N` (per party, default 4), `--ssp 40`, `--chunk-iters N`
 - output: `--json FILE`, `--csv FILE`, `--quiet`, and `--verify` (test only)
 
 Run `--help` for details. The protocol uses one TCP port; the session opens its second socket on the same port.
 
-To sweep dimensions: `D_LIST="5 10 50" REPS=3 bash scripts/bench_sweep.sh` writes `results/sweep_v2.csv`. Each run is checked with `--verify`.
+To sweep dimensions: `D_LIST="5 10 50" REPS=3 bash scripts/bench_sweep.sh` writes `results/sweep_fx.csv` (the CSV has `batch`, `qbits` and `lr` columns). Each run is checked with `--verify`.
 
 To check input privacy: `bash scripts/check_input_privacy.sh` must print `input privacy: PASS`.
 
@@ -155,9 +177,9 @@ sent of each stage. It also gives the totals, with offline + online + local = to
 
 **Why the client and the server cost about the same.** In authenticated garbling the garbled circuit is not produced by
 the garbler alone. Both parties hold shares of every wire mask, and they jointly generate an authenticated AND triple per
-gate with OT extension. That symmetric step is about 85% of the time and communication. The garbler-only work is computing the
+gate with OT extension. Together with the one-time setup, that symmetric step is most of the time and communication. The garbler-only work is computing the
 garbled tables (about 33 B per AND, client to server), and the evaluator-only work is evaluating them. The asymmetry shows in
-the online rows (for example, at d=5 with 3 iterations, the client sends 30 MiB online and the server 0.1 MiB), not in the
+the online rows (the client sends the garbled tables, the server sends almost nothing online), not in the
 totals. A protocol where the garbler bears most of the cost would be semi-honest Yao (not malicious) or
 cut-and-choose (a different protocol family).
 
@@ -173,10 +195,12 @@ few tasks in flight per party (the two OT directions, the garble/evaluate pass a
 | file | contents |
 |---|---|
 | `src/lr_gc_ag2pc.cpp` | the two-party program: client inputs, per-iteration checkpoints, reveal to the server, report |
-| `src/lr_gc_selftest.cpp` | float-op exactness, sigmoid accuracy, bit-exact training checks, gate counts |
-| `include/lr_circuit.h` | the float32 LR training circuit, generic over any emp-tool context |
-| `include/lr_reference.h` | plaintext float32 specification (bit-exact twin of the circuit) and a double-precision reference |
-| `include/lr_params.h` | fixed parameters, deterministic generation of the client's data and initial weights (splitmix64) |
+| `src/lr_gc_dot_sigmoid.cpp` | test circuit: one dot product + truncation + one sigmoid (ClearCtx or AG2PC), checked against the spec |
+| `src/lr_gc_selftest.cpp` | primitive exactness, truncation, sigmoid thresholds, bit-exact training checks, gate counts |
+| `include/sbit.h` | constant-folding bits and range-tracked two's-complement integers over any emp-tool context |
+| `include/lr_circuit.h` | the fixed-point LR training circuit (dot, truncate, qsigmoid, step), generic over any emp-tool context |
+| `include/lr_reference.h` | plaintext fixed-point specification (bit-exact twin of the circuit) and the sigmoid thresholds |
+| `include/lr_params.h` | parameters, deterministic generation of the client's data and initial weights (splitmix64), CLI helpers |
 | `include/ag2pc_metrics.h` | per-phase metrics hooks (must be included before emp-ag2pc) |
 | `src/lr_gc_client_inputs.cpp`, `scripts/check_input_privacy.sh` | input-privacy regression test (recording proxy) |
 | `third_party/emp-ag2pc/` | emp-ag2pc `a245ca0` headers with the input-privacy fix (`input-privacy.patch`, `README.md`) |

@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # Sweep the dimension d (REPS runs each) on localhost; one CSV row per run.
-#   D_LIST="5 10 50 100" REPS=3 scripts/bench_sweep.sh [extra flags]    # -> results/sweep_v2.csv
+#   D_LIST="5 10 50 100" REPS=3 scripts/bench_sweep.sh [extra flags]    # -> results/sweep_fx.csv
 # VERIFY=1 (default) makes the server check every run bit for bit against the plaintext
-# float reference (the 'verified' CSV column and a PASS/FAIL per run); VERIFY=0 skips it.
+# fixed-point reference (the 'verified' CSV column and a PASS/FAIL per run); VERIFY=0 skips it.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 D_LIST="${D_LIST:-5 10 20 50 100}"
 REPS="${REPS:-3}"
-OUT="${OUT:-results/sweep_v2.csv}"  # new column layout; older results/sweep.csv runs used the leaky library
+OUT="${OUT:-results/sweep_fx.csv}"  # fixed-point column layout (sweep_v2.csv: float32 version; sweep.csv: leaky library)
 V=""; [ "${VERIFY:-1}" = "1" ] && V="--verify"
 mkdir -p results
 for d in $D_LIST; do

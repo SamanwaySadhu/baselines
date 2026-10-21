@@ -1,5 +1,5 @@
-// lr_gc_ag2pc -- maliciously secure two-party baseline for float32 logistic-regression
-// training using authenticated garbling (emp-ag2pc: WRK17 + KRRW18).
+// lr_gc_ag2pc -- maliciously secure two-party baseline for fixed-point (quantized)
+// logistic-regression training using authenticated garbling (emp-ag2pc: WRK17 + KRRW18).
 //
 //   party 1 = CLIENT = garbler   (emp ALICE): owns every private input -- the training
 //                                             data (x, y) and the initial weights --
@@ -7,13 +7,21 @@
 //   party 2 = SERVER = evaluator (emp BOB):   has no private input; evaluates and is the
 //                                             only party that learns the trained weights
 //
-// `iters` mini-batch SGD iterations (batch 4, lr 0.01, binary32, exact sigmoid; see
-// lr_reference.h), one protocol chunk per iteration by default. The client's inputs
-// enter through the WRK17/KRRW input phase: each input wire's mask lambda is an
-// authenticated bit from the OT-extension (COT) session, the server opens its mask
-// share to the client only, and the client sends x xor lambda. This needs the patched
-// emp-ag2pc in third_party/emp-ag2pc (upstream sends inputs in the clear). The
-// weights are opened to the server only.
+// `iters` mini-batch SGD iterations with the fixed-point semantics of lr_reference.h:
+// inputs are qbits-bit quantized values (default 6 bits: integers in [-32, 31] at
+// scale 2^5), every dot product is truncated back to scale 2^f right after it is
+// computed, and the sigmoid is the exact sigmoid quantized to qbits bits. One protocol
+// chunk per iteration by default.
+//
+// Client input order (the contract with lr_gc_client_inputs / check_input_privacy.sh):
+// one input batch per iteration t holding, if t == 0, the d initial weights, then for
+// each datapoint its d_data feature columns and its label bit. Every quantized value
+// is qbits secret bits, two's complement, LSB first; the bias column is the public
+// constant MAXQ, not an input. The inputs enter through the WRK17/KRRW input phase:
+// each input wire's mask lambda is an authenticated bit from the OT-extension (COT)
+// session, the server opens its mask share to the client only, and the client sends
+// x xor lambda. This needs the patched emp-ag2pc in third_party/emp-ag2pc (upstream
+// sends inputs in the clear). The weights are opened to the server only.
 //
 // Reported per party: wall/CPU time and bytes sent/received of every protocol phase
 // -- setup, function-dependent preprocessing (authenticated AND triples), input
@@ -33,11 +41,13 @@
 #include "lr_circuit.h"
 #include "lr_params.h"
 #include "lr_reference.h"
+#include "sbit.h"
 
 #include "emp-tool/ir/context/count.h"
 
 #include <algorithm>
 #include <cinttypes>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -50,13 +60,15 @@
 #include <unordered_set>
 #include <vector>
 
+using lrgc::Builder;
 using lrgc::Metrics;
 using lrgc::Params;
 using lrgc::PhaseStat;
+using lrgc::SBit;
+using lrgc::SInt;
 
 using Ctx = emp::AG2PCSession::ctx_t;
 using Wire = Ctx::Wire;
-using Fl = emp::Float_T<Ctx, 32>;
 
 namespace {
 
@@ -71,6 +83,7 @@ struct Options {
   int chunk_iters = 1;
   bool verify = false;
   bool quiet = false;
+  std::string data_path, eval_path;  // --data (client), --eval (server, test only)
   std::string json_path, csv_path;
 };
 
@@ -79,11 +92,17 @@ void usage(const char* prog) {
       "usage: %s <client|server> [options]\n"
       "  client = party 1 = garbler (emp ALICE), server = party 2 = evaluator (emp BOB)\n"
       "  (1 / 2, garbler / evaluator and alice / bob are accepted too)\n\n"
-      "training (batch = 4, lr = 0.01, float32 are fixed; both parties must pass the same --d / --iters):\n"
-      "  --d N            features incl. the bias column, >= 2 (default 5)\n"
+      "training (both parties must pass the same values; --seed / --zero-init only shape the\n"
+      "client's private inputs and are used by the server only for --verify):\n"
+      "  --d N            features incl. the bias column (default 5)\n"
       "  --iters N        SGD iterations (default 20)\n"
-      "  --seed N         client: seed of its random data / initial weights (default 1);\n"
-      "                   server: only used by --verify\n\n"
+      "  --batch N        datapoints per iteration (default 4)\n"
+      "  --qbits N        quantization bits of every input, 2..12 (default 6: integers in\n"
+      "                   [-32, 31] at scale 2^5); dot products are truncated back to it\n"
+      "  --lr X           learning rate; batch/lr must be a power of two (default 0.5)\n"
+      "  --no-bias        the last feature is a regular client feature, not the bias\n"
+      "  --zero-init      client's initial weights are 0 (default: uniform random)\n"
+      "  --seed N         seed of the client's random data / initial weights (default 1)\n\n"
       "protocol / network:\n"
       "  --host IP        server address the client connects to (default 127.0.0.1)\n"
       "  --port N         TCP port; the server listens on it (default 12345)\n"
@@ -93,7 +112,7 @@ void usage(const char* prog) {
       "output:\n"
       "  --verify         TEST ONLY: the server regenerates the client's data and initial\n"
       "                   weights from --seed and checks the trained weights against the\n"
-      "                   plaintext float reference (bit-exact). This is outside the\n"
+      "                   plaintext fixed-point reference (exact). This is outside the\n"
       "                   protocol: a real server never has the client's seed.\n"
       "  --json FILE      write all metrics as JSON\n"
       "  --csv FILE       append one summary row (header written if the file is new)\n"
@@ -118,6 +137,8 @@ Options parse_options(int argc, char** argv) {
     else if (a == "--ssp") O.ssp = (int)lrgc::parse_int(r.next_value(a), a);
     else if (a == "--chunk-iters") O.chunk_iters = (int)lrgc::parse_int(r.next_value(a), a);
     else if (a == "--verify") O.verify = true;
+    else if (a == "--data") O.data_path = r.next_value(a);
+    else if (a == "--eval") O.eval_path = r.next_value(a);
     else if (a == "--quiet") O.quiet = true;
     else if (a == "--json") O.json_path = r.next_value(a);
     else if (a == "--csv") O.csv_path = r.next_value(a);
@@ -201,9 +222,11 @@ struct PartyReport {
 
 // --------------------------------------- weights <-> fixed-width emp values
 // checkpoint(keep...) and reveal(v, ...) take values of compile-time width, while the
-// number of weights is a run-time choice. The weights' wires are therefore packed
-// into one BitVec_T<ctx_t, N> (N = smallest capacity that fits, padded with a
-// public-zero wire). Wire ids are stable across a checkpoint.
+// number of weights and their widths (range-tracked, see sbit.h) are known only at
+// run time. The weights' secret wires are therefore packed into one BitVec_T<ctx_t, N>
+// (N = smallest capacity that fits, padded with a public-zero wire); bits that are
+// public constants stay in the Builder and are never kept. Wire ids are stable
+// across a checkpoint.
 template <class F>
 void with_capacity(size_t n, F&& f) {
   if (n <= 64) f(std::integral_constant<int, 64>{});
@@ -216,29 +239,30 @@ void with_capacity(size_t n, F&& f) {
 }
 
 struct WeightPack {
-  std::vector<Wire> secret;  // unique wires of the weights, in pack order
+  std::vector<Wire> secret;  // unique secret wires of the weights, in pack order
   std::vector<Wire> ids;     // the packed value's wires (secret + padding), size = N
 };
 
-WeightPack checkpoint_weights(emp::AG2PCSession& sess, const std::vector<Fl>& w) {
+WeightPack checkpoint_weights(emp::AG2PCSession& sess, Builder<Ctx>& B, const std::vector<SInt<Ctx>>& w) {
   WeightPack pk;
   std::unordered_set<Wire> seen;
   for (const auto& v : w)
-    for (const Wire& b : v.w)
-      if (seen.insert(b).second) pk.secret.push_back(b);
+    for (const auto& b : v.b)
+      if (!b.is_const() && seen.insert(b.w).second) pk.secret.push_back(b.w);
   with_capacity(pk.secret.size(), [&](auto cap) {
     constexpr int N = decltype(cap)::value;
     pk.ids = pk.secret;
-    if ((int)pk.ids.size() < N) pk.ids.resize(N, sess.ctx().public_bit(false));
+    if ((int)pk.ids.size() < N) pk.ids.resize(N, B.materialize(Builder<Ctx>::cst(false)));
     auto bv = std::make_unique<emp::BitVec_T<Ctx, N>>(emp::BitVec_T<Ctx, N>::from_wires(sess.ctx(), pk.ids.data()));
     sess.checkpoint(*bv);
   });
   return pk;
 }
 
-// Opens the (checkpointed, hence materialized) weights to `recipient`.
-std::optional<std::vector<float>> reveal_weights(emp::AG2PCSession& sess, const WeightPack& pk,
-                                                 const std::vector<Fl>& w, int recipient) {
+// Opens the (checkpointed, hence materialized) weights to `recipient` and decodes
+// each one as two's complement at its own width (constant bits come from the Builder).
+std::optional<std::vector<int64_t>> reveal_weights(emp::AG2PCSession& sess, const WeightPack& pk,
+                                                   const std::vector<SInt<Ctx>>& w, int recipient) {
   std::optional<std::vector<uint8_t>> bits;
   with_capacity(pk.ids.size(), [&](auto cap) {
     constexpr int N = decltype(cap)::value;
@@ -249,14 +273,41 @@ std::optional<std::vector<float>> reveal_weights(emp::AG2PCSession& sess, const 
   if (!bits) return std::nullopt;
   std::unordered_map<Wire, size_t> pos;
   for (size_t k = 0; k < pk.secret.size(); ++k) pos[pk.secret[k]] = k;
-  std::vector<float> vals;
+  std::vector<int64_t> vals;
   for (const auto& v : w) {
-    uint32_t u = 0;
-    for (int i = 0; i < 32; ++i)
-      if ((*bits)[pos.at(v.w[(size_t)i])] != 0) u |= uint32_t(1) << i;
-    vals.push_back(lrgc::u2f(u));
+    uint64_t u = 0;
+    const int n = v.width();
+    for (int i = 0; i < n; ++i) {
+      const auto& b = v.b[(size_t)i];
+      const bool bit = b.is_const() ? b.k == 1 : (*bits)[pos.at(b.w)] != 0;
+      if (bit) u |= uint64_t(1) << i;
+    }
+    if (n < 64 && ((u >> (n - 1)) & 1)) u |= ~((uint64_t(1) << n) - 1);
+    vals.push_back((int64_t)u);
   }
   return vals;
+}
+
+// --verify only: the same SGD on the same encoded inputs in double precision with no
+// rounding at all (x = X / 2^f, label = MAXQ*y / 2^f, exact sigmoid, w -= lr/batch * g),
+// to show how far the fixed-point weights drift from unquantized training.
+std::vector<double> reference_train_real(const Params& P, const lrgc::Dataset& D, const std::vector<int64_t>& w0) {
+  const double s = std::ldexp(1.0, P.f), step = P.lr / P.batch;
+  std::vector<double> w(w0.size()), e((size_t)P.batch);
+  for (size_t j = 0; j < w0.size(); ++j) w[j] = (double)w0[j] / s;
+  for (int t = 0; t < P.iters; ++t) {
+    for (int i = 0; i < P.batch; ++i) {
+      double z = 0;
+      for (int j = 0; j < P.d; ++j) z += w[(size_t)j] * ((double)D.X(t, i, j) / s);
+      e[(size_t)i] = 1.0 / (1.0 + std::exp(-z)) - (double)(P.maxq * D.Y(t, i)) / s;
+    }
+    for (int j = 0; j < P.d; ++j) {
+      double g = 0;
+      for (int i = 0; i < P.batch; ++i) g += e[(size_t)i] * ((double)D.X(t, i, j) / s);
+      w[(size_t)j] -= step * g;
+    }
+  }
+  return w;
 }
 
 // -------------------------------------------------------------- printing
@@ -302,13 +353,21 @@ Stages stages(const PartyReport& r) {
 void print_report(const Options& O, const PartyReport& cl, const PartyReport& sv, uint64_t predicted_and,
                   uint64_t in_client_bits, uint64_t in_server_bits, uint64_t out_bits) {
   const Params& P = O.P;
-  std::printf("\n================= emp-ag2pc authenticated garbling (WRK17 + KRRW18): float32 LR training =================\n");
+  std::printf("\n================= emp-ag2pc authenticated garbling (WRK17 + KRRW18): fixed-point LR training "
+              "(qbits=%d) =================\n", P.qbits);
   std::printf("config   : %s\n", lrgc::params_string(P).c_str());
   std::printf("protocol : client = party 1 = garbler, server = party 2 = evaluator; ssp=%d; %d thread(s)/party; "
               "%d iteration(s)/chunk\n", O.ssp, O.threads, O.chunk_iters);
-  std::printf("circuit  : %.0f AND gates garbled (predicted %" PRIu64 "); private inputs: client %" PRIu64
+  // The prediction counts every AND the circuit emits; emp-ag2pc garbles only the live
+  // ones. They are equal except with --batch 1 (d_data dead ANDs per iteration, see
+  // lr_gc_selftest [6]).
+  const uint64_t garbled = (uint64_t)cl.num_and;
+  const std::string dead = garbled == predicted_and ? std::string()
+      : ", of which " + std::to_string(predicted_and - std::min(predicted_and, garbled)) +
+        " dead ANDs were removed by emp-ag2pc";
+  std::printf("circuit  : %" PRIu64 " AND gates garbled (predicted %" PRIu64 "%s); private inputs: client %" PRIu64
               " bits, server %" PRIu64 " bits; output: %" PRIu64 " bits to the server only\n",
-              cl.num_and, predicted_and, in_client_bits, in_server_bits, out_bits);
+              garbled, predicted_and, dead.c_str(), in_client_bits, in_server_bits, out_bits);
 
   // ---- per-phase table ----
   std::printf("\n%-46s | %11s %11s | %11s %11s | %12s %12s\n", "phase (summed over all chunks)", "client ms",
@@ -411,29 +470,42 @@ int main(int argc, char** argv) {
   const char* me = is_client ? "client" : "server";
   std::setvbuf(stdout, nullptr, _IOLBF, 0);
 
+  // Public thresholds of the quantized sigmoid (depend on qbits only).
+  const lrgc::SigmoidTable S = lrgc::make_sigmoid_table(P.f);
+
   // The client's private inputs (the server has none). The server never generates them;
   // only --verify (test-only) regenerates them from the seed after the protocol ends.
   lrgc::Dataset D;
-  std::vector<float> w0;
+  std::vector<int64_t> w0;
   if (is_client) {
-    D = lrgc::generate_client_data(P);
-    w0 = lrgc::generate_initial_weights(P);
+    if (!O.data_path.empty()) {
+      const lrgc::RealData R = lrgc::load_real_data(O.data_path, P);
+      D = lrgc::real_train_set(R, P);
+      w0 = R.w0;
+    } else {
+      D = lrgc::generate_client_data(P);
+      w0 = lrgc::generate_initial_weights(P);
+    }
   }
 
   // Circuit size, from a dry run over emp::CountCtx on all-zero data of the right
-  // shape (the count is data-independent; the server never sees the client's data).
+  // shape (every input bit is a secret wire there too, so the count is
+  // data-independent; the server never sees the client's data).
   uint64_t predicted_and = 0;
   {
     lrgc::Dataset Z;
     Z.iters = P.iters;
+    Z.batch = P.batch;
     Z.d = P.d;
-    Z.x.assign((size_t)P.iters * lrgc::kBatch * P.d, 0.0f);
-    Z.y.assign((size_t)P.iters * lrgc::kBatch, 0);
+    Z.x.assign((size_t)P.iters * P.batch * P.d, 0);
+    Z.y.assign((size_t)P.iters * P.batch, 0);
     emp::CountCtx cc;
-    (void)lrgc::train_offline(cc, P, Z, std::vector<float>((size_t)P.d, 0.0f));
+    Builder<emp::CountCtx> Bc(cc);
+    (void)lrgc::train_offline(Bc, P, S, Z, std::vector<int64_t>((size_t)P.d, 0));
     predicted_and = cc.ands;
   }
-  const uint64_t in_client_bits = (uint64_t)P.d * 32 + (uint64_t)P.iters * lrgc::kBatch * ((uint64_t)P.d_data() * 32 + 1);
+  const uint64_t in_client_bits =
+      (uint64_t)P.d * P.qbits + (uint64_t)P.iters * P.batch * ((uint64_t)P.d_data * P.qbits + 1);
   const uint64_t in_server_bits = 0;
   std::printf("[%s] %s\n[%s] circuit: %" PRIu64 " AND gates; %s\n", me, lrgc::params_string(P).c_str(), me,
               predicted_and,
@@ -462,35 +534,57 @@ int main(int argc, char** argv) {
 
   // ---- training ----
   // Iteration t's chunk: the client inputs batch t (and, at t = 0, the initial weights),
-  // the circuit for one SGD step is recorded, and the weights are checkpointed.
-  std::vector<Fl> w;
+  // the circuit for one SGD step is recorded, and the weights are checkpointed. Every
+  // quantized value enters as qbits secret bits (two's complement, LSB first), the
+  // label as one bit; the server feeds placeholders (it owns none of these inputs).
+  Builder<Ctx> B(sess->ctx());
+  lrgc::LRCircuit<Ctx> lr(B, P, S);
+  using BitV = emp::Bit_T<Ctx>;
+  auto add_quantized = [&](auto& batch, int64_t v) {  // v is used at the client only
+    const std::vector<bool> bits = lrgc::to_bits(is_client ? v : 0, P.qbits);
+    std::vector<Wire> ws;
+    ws.reserve((size_t)P.qbits);
+    for (int k = 0; k < P.qbits; ++k) ws.push_back(batch.template add<BitV>(emp::ALICE, (bool)bits[(size_t)k]).w);
+    return ws;
+  };
+  std::vector<SInt<Ctx>> w;
   WeightPack pack;
   for (int t = 0; t < P.iters; ++t) {
     const Metrics::Mark it0 = M.now();
     auto batch = sess->input_batch();
+    std::vector<std::vector<Wire>> w0w;
     if (t == 0)
-      for (int j = 0; j < P.d; ++j) w.push_back(batch.add<Fl>(emp::ALICE, is_client ? w0[(size_t)j] : 0.0f));
-    std::vector<std::vector<Fl>> x((size_t)lrgc::kBatch);
-    std::vector<emp::Bit_T<Ctx>> yb;
-    for (int i = 0; i < lrgc::kBatch; ++i) {
-      for (int j = 0; j < P.d_data(); ++j) x[(size_t)i].push_back(batch.add<Fl>(emp::ALICE, is_client ? D.X(t, i, j) : 0.0f));
-      yb.push_back(batch.add<emp::Bit_T<Ctx>>(emp::ALICE, is_client && D.Y(t, i) != 0));
+      for (int j = 0; j < P.d; ++j) w0w.push_back(add_quantized(batch, is_client ? w0[(size_t)j] : 0));
+    std::vector<std::vector<std::vector<Wire>>> xw((size_t)P.batch);
+    std::vector<Wire> yw((size_t)P.batch);
+    for (int i = 0; i < P.batch; ++i) {
+      for (int j = 0; j < P.d_data; ++j) xw[(size_t)i].push_back(add_quantized(batch, is_client ? D.X(t, i, j) : 0));
+      yw[(size_t)i] = batch.add<BitV>(emp::ALICE, is_client && D.Y(t, i) != 0).w;
     }
     batch.finish();
 
-    lrgc::FloatLR<Ctx> lr(sess->ctx(), P.d);
-    std::vector<Fl> y;
-    for (const auto& b : yb) y.push_back(lr.label(b.w));
+    if (t == 0)
+      for (int j = 0; j < P.d; ++j) w.push_back(lr.quantized(w0w[(size_t)j]));
+    std::vector<std::vector<SInt<Ctx>>> x;
+    std::vector<SBit<Ctx>> y;
+    for (int i = 0; i < P.batch; ++i) {
+      x.push_back(lr.feature_row(xw[(size_t)i]));
+      y.push_back(Builder<Ctx>::wire(yw[(size_t)i]));
+    }
     w = lr.step(w, x, y);
-    if ((t + 1) % O.chunk_iters == 0 || t + 1 == P.iters) pack = checkpoint_weights(*sess, w);
+    if ((t + 1) % O.chunk_iters == 0 || t + 1 == P.iters) pack = checkpoint_weights(*sess, B, w);
 
     const double it_s = Metrics::diff(it0, M.now()).wall_s;
     rep.iter_wall_s.push_back(it_s);
-    if (!O.quiet) std::printf("[%s] iteration %2d/%d done (%.2f ms)\n", me, t + 1, P.iters, it_s * 1e3);
+    if (!O.quiet) {
+      const auto [wmin, wmax] = std::minmax_element(w.begin(), w.end(), [](auto& a, auto& b) { return a.width() < b.width(); });
+      std::printf("[%s] iteration %2d/%d done (%.2f ms; weights now %d..%d bits)\n", me, t + 1, P.iters, it_s * 1e3,
+                  wmin->width(), wmax->width());
+    }
   }
 
   // ---- output: the trained weights are opened to the server only ----
-  const std::optional<std::vector<float>> trained = reveal_weights(*sess, pack, w, emp::BOB);
+  const std::optional<std::vector<int64_t>> trained = reveal_weights(*sess, pack, w, emp::BOB);
   const Metrics::Mark t_end = M.now();
   rep.total = Metrics::diff(t_start, t_end);
   rep.total.sent = t_end.sent - s0;
@@ -531,7 +625,8 @@ int main(int argc, char** argv) {
   const PartyReport peer = PartyReport::deserialize(theirs, P.iters);
   const PartyReport& cl = is_client ? rep : peer;
   const PartyReport& sv = is_client ? peer : rep;
-  const uint64_t out_bits = (uint64_t)P.d * 32;
+  // Opened bits: each weight at its range-tracked width (constant bits included).
+  const uint64_t out_bits = [&] { uint64_t s = 0; for (const auto& v : w) s += (uint64_t)v.width(); return s; }();
 
   print_report(O, cl, sv, predicted_and, in_client_bits, in_server_bits, out_bits);
 
@@ -543,23 +638,39 @@ int main(int argc, char** argv) {
     if (trained) rc = 1;
   } else {
     if (!trained) { std::fprintf(stderr, "[server] ERROR: no output at the server\n"); return 1; }
-    std::printf("\n[server] trained weights (float32):");
-    for (size_t j = 0; j < trained->size() && j < 16; ++j) std::printf(" %.9g", (double)(*trained)[j]);
+    std::printf("\n[server] trained weights (integers, scale 2^%d):", P.f);
+    for (size_t j = 0; j < trained->size() && j < 16; ++j) std::printf(" %" PRId64, (*trained)[j]);
     std::printf("%s\n", trained->size() > 16 ? " ..." : "");
+    if (!O.eval_path.empty()) {
+      const lrgc::RealData R = lrgc::load_real_data(O.eval_path, P);
+      const std::vector<int64_t> ref = lrgc::reference_train(P, lrgc::real_train_set(R, P), R.w0);
+      int ok = 0;
+      const double acc = lrgc::accuracy(P, R, *trained, &ok);
+      const double acc0 = lrgc::accuracy(P, R, R.w0);
+      std::printf("[server] --eval: secure result %s the plaintext reference\n", ref == *trained ? "equals" : "DIFFERS FROM");
+      std::printf("[server] ACCURACY on all %d rows: %.2f%% (%d/%d) after %d iterations x batch %d (initial weights: %.2f%%)\n",
+                  R.n, acc, ok, R.n, P.iters, P.batch, acc0);
+      if (ref != *trained) rc = 1;
+    }
     if (O.verify) {
-      const std::vector<float> w0_ref = lrgc::generate_initial_weights(P);
-      const std::vector<float> ref = lrgc::reference_train(P, lrgc::generate_client_data(P), w0_ref);
-      bool ok = ref.size() == trained->size();
-      for (size_t j = 0; ok && j < ref.size(); ++j) ok = lrgc::f2u(ref[j]) == lrgc::f2u((*trained)[j]);
+      const lrgc::Dataset Dv = lrgc::generate_client_data(P);
+      const std::vector<int64_t> w0_ref = lrgc::generate_initial_weights(P);
+      const std::vector<int64_t> ref = lrgc::reference_train(P, Dv, w0_ref);
+      const bool ok = ref == *trained;
       verified = ok ? "pass" : "FAIL";
-      std::printf("[server] --verify: %s (secure result %s the plaintext float reference, bit for bit)\n",
+      std::printf("[server] --verify: %s (secure result %s the plaintext fixed-point reference)\n",
                   ok ? "PASS" : "FAIL", ok ? "equals" : "DIFFERS FROM");
-      if (!ok) rc = 1;
-      const std::vector<double> wd = lrgc::reference_train_double(P, lrgc::generate_client_data(P),
-                                                                 std::vector<double>(w0_ref.begin(), w0_ref.end()));
+      if (!ok) {
+        rc = 1;
+        std::printf("[server] reference weights:");
+        for (size_t j = 0; j < ref.size() && j < 16; ++j) std::printf(" %" PRId64, ref[j]);
+        std::printf("%s\n", ref.size() > 16 ? " ..." : "");
+      }
+      const std::vector<double> wd = reference_train_real(P, Dv, w0_ref);
       double worst = 0;
-      for (size_t j = 0; j < wd.size(); ++j) worst = std::max(worst, std::fabs((double)(*trained)[j] - wd[j]));
-      std::printf("[server] max |w_float32 - w_float64 (true-exp) reference| = %.3e\n", worst);
+      for (size_t j = 0; j < wd.size(); ++j)
+        worst = std::max(worst, std::fabs((double)(*trained)[j] / std::ldexp(1.0, P.f) - wd[j]));
+      std::printf("[server] max |w_fixed/2^%d - w_double (unquantized SGD, same inputs)| = %.4f\n", P.f, worst);
     }
   }
 
@@ -578,8 +689,9 @@ int main(int argc, char** argv) {
     std::ostringstream js;
     js.precision(10);
     js << "{\"party\":\"" << me << "\",\"params\":{\"d\":" << P.d << ",\"iters\":" << P.iters << ",\"batch\":"
-       << lrgc::kBatch << ",\"lr\":" << lrgc::kLr << ",\"number_format\":\"float32\""
-       << ",\"seed\":" << P.seed << ",\"threads\":" << O.threads << ",\"ssp\":" << O.ssp
+       << P.batch << ",\"lr\":" << P.lr << ",\"number_format\":\"fixed-point\",\"qbits\":" << P.qbits
+       << ",\"f\":" << P.f << ",\"bias\":" << (P.bias ? "true" : "false")
+       << ",\"zero_init\":" << (P.zero_init ? "true" : "false") << ",\"seed\":" << P.seed << ",\"threads\":" << O.threads << ",\"ssp\":" << O.ssp
        << ",\"chunk_iters\":" << O.chunk_iters << "},\"and_gates\":" << cl.num_and
        << ",\"predicted_and_gates\":" << predicted_and << ",\"input_bits\":{\"client\":" << in_client_bits
        << ",\"server\":" << in_server_bits << "},\"output_bits\":" << out_bits << ",\"verified\":\"" << verified
@@ -604,7 +716,7 @@ int main(int argc, char** argv) {
   }
   if (!O.csv_path.empty()) {
     const std::string header =
-        "party,d,iters,threads,ssp,chunk_iters,and_gates,"
+        "party,d,iters,batch,qbits,lr,number_format,threads,ssp,chunk_iters,and_gates,"
         "client_offline_ms,client_online_ms,client_local_ms,client_total_ms,"
         "client_offline_cpu_ms,client_online_cpu_ms,client_local_cpu_ms,client_total_cpu_ms,"
         "server_offline_ms,server_online_ms,server_local_ms,server_total_ms,"
@@ -617,7 +729,8 @@ int main(int argc, char** argv) {
     const bool fresh = !probe.good() || !std::getline(probe, first) || first.empty();
     probe.close();
     if (!fresh && first != header) {
-      std::fprintf(stderr, "[%s] ERROR: %s has a different column layout (written by an older version); "
+      std::fprintf(stderr, "[%s] ERROR: %s has a different column layout (written by an older version, e.g. "
+                           "the float32 one); "
                            "row not written. Use a new file.\n", me, O.csv_path.c_str());
       return rc ? rc : 1;
     }
@@ -627,12 +740,12 @@ int main(int argc, char** argv) {
     const Stages gc = stages(cl), gs = stages(sv);
     char row[2048];
     std::snprintf(row, sizeof row,
-                  "%s,%d,%d,%d,%d,%d,%.0f,"
+                  "%s,%d,%d,%d,%d,%g,fixed-point,%d,%d,%d,%.0f,"
                   "%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,"
                   "%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,"
                   "%.3f,%.3f,%.3f,%.3f,"
                   "%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%.1f,%.1f,%s\n",
-                  me, P.d, P.iters, O.threads, O.ssp, O.chunk_iters, cl.num_and,
+                  me, P.d, P.iters, P.batch, P.qbits, P.lr, O.threads, O.ssp, O.chunk_iters, cl.num_and,
                   gc.offline.wall_s * 1e3, gc.online.wall_s * 1e3, gc.local.wall_s * 1e3, cl.total.wall_s * 1e3,
                   gc.offline.cpu_s * 1e3, gc.online.cpu_s * 1e3, gc.local.cpu_s * 1e3, cl.total.cpu_s * 1e3,
                   gs.offline.wall_s * 1e3, gs.online.wall_s * 1e3, gs.local.wall_s * 1e3, sv.total.wall_s * 1e3,

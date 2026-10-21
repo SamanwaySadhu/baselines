@@ -36,15 +36,17 @@ target_compile_features(emp_ag2pc_headers INTERFACE cxx_std_20)
 add_executable(lr_gc_ag2pc src/lr_gc_ag2pc.cpp)
 target_include_directories(lr_gc_ag2pc PRIVATE include)
 target_link_libraries(lr_gc_ag2pc PRIVATE emp_ag2pc_headers)
-# The plaintext reference must round exactly like the circuit's unfused float ops.
-target_compile_options(lr_gc_ag2pc PRIVATE -ffp-contract=off)
 
 # Offline correctness tests + gate counts (no networking).
 add_executable(lr_gc_selftest src/lr_gc_selftest.cpp)
 target_include_directories(lr_gc_selftest PRIVATE include)
 target_link_libraries(lr_gc_selftest PRIVATE emp-tool::emp-tool)
 target_compile_features(lr_gc_selftest PRIVATE cxx_std_20)
-target_compile_options(lr_gc_selftest PRIVATE -ffp-contract=off)
+
+# Small test circuit: one dot product + one sigmoid (offline over ClearCtx, or over AG2PC).
+add_executable(lr_gc_dot_sigmoid src/lr_gc_dot_sigmoid.cpp)
+target_include_directories(lr_gc_dot_sigmoid PRIVATE include)
+target_link_libraries(lr_gc_dot_sigmoid PRIVATE emp_ag2pc_headers)
 
 # Test helper for scripts/check_input_privacy.sh (prints the client's input bits).
 add_executable(lr_gc_client_inputs src/lr_gc_client_inputs.cpp)
