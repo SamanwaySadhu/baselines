@@ -41,10 +41,10 @@ set(FAKE_OFFLINE_DIR "${CMAKE_BINARY_DIR}/fake-offline-data")
 add_library(mdml STATIC
   ${MDML_DIR}/src/networking/Party.cpp
   ${MDML_DIR}/src/utils/Timer.cpp)
-target_include_directories(mdml PUBLIC ${MDML_DIR}/src ${CMAKE_SOURCE_DIR}/include)
+target_include_directories(mdml PUBLIC ${MDML_DIR}/src ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/../wan)
 target_include_directories(mdml SYSTEM PUBLIC ${Boost_INCLUDE_DIRS})
 target_compile_definitions(mdml PUBLIC FAKE_OFFLINE_DIR="${FAKE_OFFLINE_DIR}")
-target_link_libraries(mdml PUBLIC Eigen3::Eigen OpenSSL::Crypto Threads::Threads OpenMP::OpenMP_CXX)
+target_link_libraries(mdml PUBLIC Eigen3::Eigen OpenSSL::Crypto Threads::Threads OpenMP::OpenMP_CXX ${CMAKE_DL_LIBS})
 
 foreach(prog lr_mdml lr_mdml_dealer lr_mdml_selftest)
   add_executable(${prog} src/${prog}.cpp)

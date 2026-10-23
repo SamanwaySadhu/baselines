@@ -1,5 +1,5 @@
 diff --git a/src/networking/Party.cpp b/src/networking/Party.cpp
-index 09a4246..4e5b1c3 100644
+index 09a4246..45a8856 100644
 --- a/src/networking/Party.cpp
 +++ b/src/networking/Party.cpp
 @@ -7,6 +7,7 @@
@@ -10,19 +10,24 @@ index 09a4246..4e5b1c3 100644
  
  #include <boost/asio.hpp>
  
-@@ -29,7 +30,10 @@ Party::Party(std::size_t p_my_id, std::size_t p_num_parties, std::size_t p_port)
+@@ -29,7 +30,15 @@ Party::Party(std::size_t p_my_id, std::size_t p_num_parties, std::size_t p_port)
          receive_sockets_.emplace_back(io_context_);
          timers_.emplace_back(io_context_);
  
 -        send_endpoints_.emplace_back(boost::asio::ip::make_address("127.0.0.1"), WhichPort(my_id_, other_id));
 +        // Peer address: MDML_PEER_HOST (default 127.0.0.1), so the two parties can run on two machines.
 +        const char* peer_host = std::getenv("MDML_PEER_HOST");
++        // MDML_PEER_PORT: base port to connect to instead of the listening one (a WAN proxy listens there).
++        const char* peer_port = std::getenv("MDML_PEER_PORT");
++        const std::size_t connect_port = peer_port && *peer_port
++                                             ? WhichPort(my_id_, other_id) - port_base_ + std::strtoul(peer_port, nullptr, 10)
++                                             : WhichPort(my_id_, other_id);
 +        send_endpoints_.emplace_back(boost::asio::ip::make_address(peer_host && *peer_host ? peer_host : "127.0.0.1"),
-+                                     WhichPort(my_id_, other_id));
++                                     static_cast<uint16_t>(connect_port));
  
          // receive_endpoint is used only once and is not stored
          boost::asio::ip::tcp::endpoint receive_endpoint(boost::asio::ip::tcp::v4(), WhichPort(other_id, my_id_));
-@@ -54,6 +58,16 @@ Party::Party(std::size_t p_my_id, std::size_t p_num_parties, std::size_t p_port)
+@@ -54,6 +63,16 @@ Party::Party(std::size_t p_my_id, std::size_t p_num_parties, std::size_t p_port)
  
      io_context_.run();
  

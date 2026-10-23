@@ -62,6 +62,7 @@ void usage(const char* prog) {
       "  --semi-honest    Falcon's semi-honest protocol: no checked openings, no triple checks, no final check\n"
       "  --hosts H0,H1,H2,HC   IPv4 addresses of S0, S1, S2 and the client (default all 127.0.0.1)\n"
       "  --port N         base TCP port; the mesh uses N .. N+5 (default 12345)\n"
+      "  --connect-port N base port to connect to (default = --port); scripts/run_wan.sh points it at wan/wanproxy\n"
       "  --run-id N       nonce that all four parties must share (default 0); stale connections are dropped\n"
       "  --connect-timeout S   seconds to establish the mesh (default 60)\n"
       "  --timeout S      seconds a single receive / send may wait (default 300; the client's idle wait\n"
@@ -106,6 +107,7 @@ Options parse_options(int argc, char** argv) {
       }
       if (k != NP) throw std::invalid_argument("--hosts takes 4 addresses: S0,S1,S2,client");
     } else if (a == "--port") O.net.port = (int)parse_int(r.next_value(a), a);
+    else if (a == "--connect-port") O.net.connect_port = (int)parse_int(r.next_value(a), a);
     else if (a == "--run-id") O.net.run_id = (uint64_t)parse_int(r.next_value(a), a);
     else if (a == "--connect-timeout") O.net.connect_timeout_s = (int)parse_int(r.next_value(a), a);
     else if (a == "--timeout") O.net.timeout_s = (int)parse_int(r.next_value(a), a);
@@ -182,6 +184,36 @@ void print_tables(const ClientOutcome& O, const Totals& T) {
                 T.st[S0][s].steps);
   }
   std::printf("* max over S0, S1, S2\n");
+}
+
+// Network wait: wall time each party's protocol thread spent blocked in socket receives (wan/libwanshim.so).
+void print_wait(const ClientOutcome& O, const Totals& T) {
+  if (!wan::shim_loaded()) return;
+  const char* stages[] = {"setup", "offline", "online"};
+  const char* pn[] = {"S0", "S1", "S2", "client"};
+  std::printf("\nNETWORK WAIT (ms): wall = compute + wait; wait = time blocked in receives; client online wait includes idle time while the servers train\n");
+  std::printf("%-8s |", "stage");
+  for (int p = 0; p < NP; ++p) std::printf(" %7s wall %7s wait %6s |", pn[p], pn[p], "wait%");
+  std::printf("\n");
+  double tw[NP] = {0, 0, 0, 0}, tt[NP] = {0, 0, 0, 0};
+  for (int s = 0; s < 3; ++s) {
+    std::printf("%-8s |", stages[s]);
+    for (int p = 0; p < NP; ++p) {
+      const double w = T.st[p][s].wall_s, t = T.st[p][s].wait_s;
+      tw[p] += w; tt[p] += t;
+      std::printf(" %12s %12s %5.1f%% |", ms(w).c_str(), ms(t).c_str(), w > 0 ? 100.0 * t / w : 0.0);
+    }
+    std::printf("\n");
+  }
+  std::printf("%-8s |", "total");
+  for (int p = 0; p < NP; ++p) std::printf(" %12s %12s %5.1f%% |", ms(tw[p]).c_str(), ms(tt[p]).c_str(), tw[p] > 0 ? 100.0 * tt[p] / tw[p] : 0.0);
+  std::printf("\n");
+  std::printf("per online phase, wait ms:");
+  for (const auto& nm : all_phases()) {
+    if (nm.compare(0, 7, "online/") != 0) continue;
+    if (const PhaseRow* r = find_row(O.rows[S0], nm.c_str())) std::printf(" %s=%s", nm.c_str() + 7, ms(r->wait_s).c_str());
+  }
+  std::printf("  (at S0)\n");
 }
 
 }  // namespace
@@ -261,6 +293,7 @@ int main(int argc, char** argv) {
       rc = rc ? rc : 1;
     }
     print_tables(R, T);
+    print_wait(R, T);
 
     double so_w = 0, so_c = 0, sn_w = 0, sn_c = 0, so_csum = 0, sn_csum = 0;
     long srss = 0;
@@ -309,7 +342,7 @@ int main(int argc, char** argv) {
         for (const auto& r : R.rows[(size_t)p]) {
           if (!first) f << ",\n";
           first = false;
-          f << "    {\"party\": \"" << party_name(p) << "\", \"phase\": \"" << r.name << "\", \"wall_s\": " << r.wall_s << ", \"cpu_s\": " << r.cpu_s;
+          f << "    {\"party\": \"" << party_name(p) << "\", \"phase\": \"" << r.name << "\", \"wall_s\": " << r.wall_s << ", \"cpu_s\": " << r.cpu_s << ", \"wait_s\": " << r.wait_s;
           for (int q = 0; q < NP; ++q) f << ", \"sent_to_" << pn[q] << "\": " << r.sent[q];
           for (int q = 0; q < NP; ++q) f << ", \"recv_from_" << pn[q] << "\": " << r.recv[q];
           f << ", \"steps\": " << r.steps << ", \"calls\": " << r.calls << "}";

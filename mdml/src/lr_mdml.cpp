@@ -115,20 +115,20 @@ struct PartyReport {
     std::vector<u64> v;
     auto put = [&](double x) { v.push_back(std::bit_cast<u64>(x)); };
     auto put_stat = [&](const PhaseStat& s) {
-      put(s.wall_s); put(s.cpu_s); v.push_back(s.sent); v.push_back(s.rounds);
+      put(s.wall_s); put(s.cpu_s); put(s.wait_s); v.push_back(s.sent); v.push_back(s.rounds);
     };
     for (const auto& s : cat) put_stat(s);
     put_stat(online);
     for (double x : {connect_s, load_s, peak_rss_mib, and_gates, ltz, opened_arith, opened_bin}) put(x);
     return v;
   }
-  static size_t size() { return 4 * (NCAT + 1) + 7; }
+  static size_t size() { return 5 * (NCAT + 1) + 7; }
   static PartyReport deserialize(const std::vector<u64>& v) {
     PartyReport r;
     size_t k = 0;
     auto get = [&] { return std::bit_cast<double>(v[k++]); };
     auto get_stat = [&](PhaseStat& s) {
-      s.wall_s = get(); s.cpu_s = get(); s.sent = v[k++]; s.rounds = v[k++];
+      s.wall_s = get(); s.cpu_s = get(); s.wait_s = get(); s.sent = v[k++]; s.rounds = v[k++];
     };
     for (auto& s : r.cat) get_stat(s);
     get_stat(r.online);
@@ -163,7 +163,7 @@ std::vector<std::vector<u64>> read_verify_file(const std::string& path, uint64_t
 }
 
 void json_stat(std::ostringstream& js, const PhaseStat& s) {
-  js << "{\"wall_s\":" << s.wall_s << ",\"cpu_s\":" << s.cpu_s << ",\"sent\":" << s.sent << ",\"recv\":" << s.recv
+  js << "{\"wall_s\":" << s.wall_s << ",\"cpu_s\":" << s.cpu_s << ",\"wait_s\":" << s.wait_s << ",\"sent\":" << s.sent << ",\"recv\":" << s.recv
      << ",\"rounds\":" << s.rounds << "}";
 }
 void json_party(std::ostringstream& js, const PartyReport& r) {
@@ -242,13 +242,14 @@ int main(int argc, char** argv) {
     ctx.exchange(std::vector<uint8_t>{1}, C_LOCAL);  // start together
     ctx.stat[C_LOCAL] = PhaseStat{};
     const uint64_t sent0 = party.bytes_sent();
-    const double w0 = now_s(), c0 = cpu_now_s();
+    const double w0 = now_s(), c0 = cpu_now_s(), wt0 = wan::wait_s();
     for (auto& g : be.inputs) g->RunOnline();  // the client streams all inputs first
     ctx.stat[C_INPUT].rounds = 1;
     C.out->RunOnline();
     const bool mac_ok = mac_check(ctx);
     rep.online.wall_s = now_s() - w0;
     rep.online.cpu_s = cpu_now_s() - c0;
+    rep.online.wait_s = wan::wait_s() - wt0;
     rep.online.sent = party.bytes_sent() - sent0;
     for (int c = 0; c < NCAT; ++c) {
       rep.cat[c] = ctx.stat[c];
@@ -313,6 +314,16 @@ int main(int argc, char** argv) {
                 cl.online.sent / 1024.0, sv.online.sent / 1024.0,
                 (unsigned long long)std::max(cl.online.rounds, sv.online.rounds));
     const uint64_t total = cl.online.sent + sv.online.sent;
+    if (wan::shim_loaded()) {
+      std::printf("\nNETWORK WAIT (ms): wall = compute + wait; wait = time the protocol thread is blocked in receives\n");
+      std::printf("%-36s | %10s %10s %6s | %10s %10s %6s\n", "phase (online)", "cli wall", "cli wait", "wait%", "srv wall", "srv wait", "wait%");
+      auto pct = [](const PhaseStat& x) { return x.wall_s > 0 ? 100.0 * x.wait_s / x.wall_s : 0.0; };
+      for (int c = 0; c < NCAT; ++c)
+        std::printf("%-36s | %10.2f %10.2f %5.1f%% | %10.2f %10.2f %5.1f%%\n", kCatLabel[c], cl.cat[c].wall_s * 1e3, cl.cat[c].wait_s * 1e3,
+                    pct(cl.cat[c]), sv.cat[c].wall_s * 1e3, sv.cat[c].wait_s * 1e3, pct(sv.cat[c]));
+      std::printf("%-36s | %10.2f %10.2f %5.1f%% | %10.2f %10.2f %5.1f%%\n", "TOTAL online (inputs -> MAC check)", cl.online.wall_s * 1e3,
+                  cl.online.wait_s * 1e3, pct(cl.online), sv.online.wall_s * 1e3, sv.online.wait_s * 1e3, pct(sv.online));
+    }
     std::printf("\ncommunication: total %.3f MiB (client->server %.3f MiB, server->client %.3f MiB)\n",
                 total / 1048576.0, cl.online.sent / 1048576.0, sv.online.sent / 1048576.0);
     std::printf("work: %.0f LTZ comparisons, %.0f binary AND gates; MAC-checked openings: %.0f arithmetic, %.0f binary\n",

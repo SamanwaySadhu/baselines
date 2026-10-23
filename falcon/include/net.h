@@ -79,6 +79,7 @@ struct NetConfig {
   int me = 0;
   std::array<std::string, NP> hosts{"127.0.0.1", "127.0.0.1", "127.0.0.1", "127.0.0.1"};
   int port = 12345;              // base port; the mesh uses port .. port+5
+  int connect_port = 0;          // base port this party *connects* to (0 = port); lets a WAN proxy sit in front of the listeners
   uint64_t run_id = 0;           // must match at all four parties
   int connect_timeout_s = 60;
   int timeout_s = 300;           // per receive / send
@@ -159,7 +160,7 @@ class Net {
           } else {
             sockaddr_in a{};
             a.sin_family = AF_INET;
-            a.sin_port = htons((uint16_t)(cfg_.port + pair_index(lo, hi)));
+            a.sin_port = htons((uint16_t)((cfg_.connect_port ? cfg_.connect_port : cfg_.port) + pair_index(lo, hi)));
             if (::inet_pton(AF_INET, cfg_.hosts[lo].c_str(), &a.sin_addr) != 1)
               throw std::runtime_error("bad IPv4 address for " + std::string(party_name(lo)) + ": " + cfg_.hosts[lo]);
             while (L_[lo].fd < 0) {

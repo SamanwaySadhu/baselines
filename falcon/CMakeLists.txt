@@ -15,8 +15,8 @@ endif()
 find_package(emp-tool 1.0 CONFIG REQUIRED)
 
 add_library(falcon_common INTERFACE)
-target_include_directories(falcon_common INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_link_libraries(falcon_common INTERFACE emp-tool::emp-tool)
+target_include_directories(falcon_common INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/../wan)
+target_link_libraries(falcon_common INTERFACE emp-tool::emp-tool ${CMAKE_DL_LIBS})
 target_compile_features(falcon_common INTERFACE cxx_std_20)
 target_compile_options(falcon_common INTERFACE -Wall -Wextra)
 

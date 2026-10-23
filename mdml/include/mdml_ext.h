@@ -34,6 +34,7 @@
 #ifndef LRMDML_MDML_EXT_H
 #define LRMDML_MDML_EXT_H
 
+#include "wan_wait.h"
 #include "protocols/Gate.h"
 #include "protocols/PartyWithFakeOffline.h"
 #include "share/Spdz2kShare.h"
@@ -94,10 +95,11 @@ inline const char* const kCatKey[NCAT] = {"input", "forward", "comparison", "sig
 
 struct PhaseStat {
   double wall_s = 0, cpu_s = 0;
+  double wait_s = 0;            // wall time the protocol thread is blocked in socket receives (wan/libwanshim.so; else 0)
   uint64_t sent = 0, recv = 0;  // recv is filled from the peer's counters at the end
   uint64_t rounds = 0;          // synchronous exchanges (both parties send, then receive)
   PhaseStat& operator+=(const PhaseStat& o) {
-    wall_s += o.wall_s; cpu_s += o.cpu_s; sent += o.sent; recv += o.recv; rounds += o.rounds;
+    wall_s += o.wall_s; cpu_s += o.cpu_s; wait_s += o.wait_s; sent += o.sent; recv += o.recv; rounds += o.rounds;
     return *this;
   }
 };
@@ -210,10 +212,11 @@ struct OnlineCtx {
 // Accumulates wall/CPU time and bytes sent into one category.
 class Scope {
  public:
-  Scope(OnlineCtx& c, Cat k) : c_(c), k_(k), t0_(now_s()), cpu0_(cpu_now_s()), sent0_(c.party.bytes_sent()) {}
+  Scope(OnlineCtx& c, Cat k) : c_(c), k_(k), t0_(now_s()), cpu0_(cpu_now_s()), sent0_(c.party.bytes_sent()), wait0_(wan::wait_s()) {}
   ~Scope() {
     c_.stat[k_].wall_s += now_s() - t0_;
     c_.stat[k_].cpu_s += cpu_now_s() - cpu0_;
+    c_.stat[k_].wait_s += wan::wait_s() - wait0_;
     c_.stat[k_].sent += c_.party.bytes_sent() - sent0_;
   }
  private:
@@ -221,6 +224,7 @@ class Scope {
   Cat k_;
   double t0_, cpu0_;
   uint64_t sent0_;
+  double wait0_;
 };
 
 inline void reduce64(std::vector<u128>& v) {

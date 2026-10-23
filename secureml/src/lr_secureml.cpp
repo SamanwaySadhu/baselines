@@ -35,6 +35,7 @@ struct Options {
   Params P;
   std::string host = "127.0.0.1";
   int port = 12345;
+  int connect_port = 0;  // client: first port to connect to (0 = port); a WAN proxy listens there
   int threads = 0;  // 0 = all hardware threads
   bool semi_honest = false;
   bool verify = false, quiet = false;
@@ -61,6 +62,7 @@ void usage(const char* prog) {
       "protocol / network:\n"
       "  --host IP        server address the client connects to (default 127.0.0.1)\n"
       "  --port N         first TCP port; the protocol uses port .. port+threads (default 12345)\n"
+      "  --connect-port N client only: first port to connect to (default = --port); scripts/run_local.sh points it at wan/wanproxy\n"
       "  --threads N      worker threads AND OT connections per party (default: all hardware threads)\n"
       "  --semi-honest    the paper's original security level: no MACs, no sacrifice, semi-honest OT\n"
       "  --ssp N          statistical security parameter of the masks (default 40)\n\n"
@@ -88,6 +90,7 @@ Options parse_options(int argc, char** argv) {
     if (parse_param_flag(r, O.P)) continue;
     if (a == "--host") O.host = r.next_value(a);
     else if (a == "--port") O.port = (int)parse_int(r.next_value(a), a);
+    else if (a == "--connect-port") O.connect_port = (int)parse_int(r.next_value(a), a);
     else if (a == "--threads") O.threads = (int)parse_int(r.next_value(a), a);
     else if (a == "--semi-honest") O.semi_honest = true;
     else if (a == "--verify") O.verify = true;
@@ -147,6 +150,29 @@ void print_phase_table(const Report& R) {
   }
 }
 
+// Network wait: wall time each party's protocol thread spent blocked in socket receives (wan/libwanshim.so).
+void print_wait(const Report& R, const StageTotals (&T)[3][2]) {
+  if (!wan::shim_loaded()) return;
+  const char* stages[] = {"setup", "offline", "online"};
+  std::printf("\nNETWORK WAIT (ms): wall = compute + wait; wait = time the protocol thread is blocked in receives\n");
+  std::printf("%-8s | %10s %10s %6s | %10s %10s %6s\n", "stage", "cli wall", "cli wait", "wait%", "srv wall", "srv wait", "wait%");
+  double tw[2] = {0, 0}, tt[2] = {0, 0};
+  for (int s = 0; s < 3; ++s) {
+    std::printf("%-8s |", stages[s]);
+    for (int p = 0; p < 2; ++p) {
+      const double w = T[s][p].wall_s, t = T[s][p].wait_s;
+      tw[p] += w; tt[p] += t;
+      std::printf(" %10s %10s %5.1f%% %s", ms(w).c_str(), ms(t).c_str(), w > 0 ? 100.0 * t / w : 0.0, p == 0 ? "|" : "\n");
+    }
+  }
+  std::printf("%-8s | %10s %10s %5.1f%% | %10s %10s %5.1f%%\n", "total", ms(tw[0]).c_str(), ms(tt[0]).c_str(), tw[0] > 0 ? 100.0 * tt[0] / tw[0] : 0.0,
+              ms(tw[1]).c_str(), ms(tt[1]).c_str(), tw[1] > 0 ? 100.0 * tt[1] / tw[1] : 0.0);
+  std::printf("\n%-28s | %10s %10s | %10s %10s\n", "phase (wait in ms)", "cli wall", "cli wait", "srv wall", "srv wait");
+  for (size_t i = 0; i < R.rows[0].size() && i < R.rows[1].size(); ++i)
+    std::printf("%-28s | %10s %10s | %10s %10s\n", R.rows[0][i].name, ms(R.rows[0][i].wall_s).c_str(), ms(R.rows[0][i].wait_s).c_str(),
+                ms(R.rows[1][i].wall_s).c_str(), ms(R.rows[1][i].wait_s).c_str());
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -164,7 +190,7 @@ int main(int argc, char** argv) {
   if (!O.quiet) std::fprintf(stderr, "[%s] %s | %s | threads=%d\n", who, mal ? "MALICIOUS security (MACs + sacrifice)" : "semi-honest", params_string(P).c_str(), O.threads);
 
   try {
-    Link lk(O.me, O.host, O.port, O.threads, mal);
+    Link lk(O.me, O.host, O.port, O.threads, mal, O.connect_port);
     Mpc M(lk, mal);
     if (O.tamper != Tamper::NONE) { M.tamper.kind = O.tamper; M.tamper.who = O.cheater; }
     Recorder rec(lk);
@@ -251,6 +277,7 @@ int main(int argc, char** argv) {
         std::printf("%-8s | %10s %10s %10s %10s | %14s %14s | %8" PRIu64 " %8" PRIu64 " | %12" PRIu64 "\n", stages[s], ms(T[s][0].wall_s).c_str(),
                     ms(T[s][0].cpu_s).c_str(), ms(T[s][1].wall_s).c_str(), ms(T[s][1].cpu_s).c_str(), human_bytes(T[s][0].sent).c_str(),
                     human_bytes(T[s][1].sent).c_str(), T[s][0].main_flights, T[s][0].ot_flights_max, T[s][0].ots);
+      print_wait(R, T);
       std::printf("flights = main-channel direction runs (a symmetric exchange = 2); ot-fl = direction runs on the busiest OT channel\n");
 
       double wall[2] = {0, 0}, cpu[2] = {0, 0};
@@ -287,7 +314,7 @@ int main(int argc, char** argv) {
         for (const auto& r : R.rows[p]) {
           if (!first) f << ",\n";
           first = false;
-          f << "    {\"party\": \"" << (p == 0 ? "client" : "server") << "\", \"phase\": \"" << r.name << "\", \"wall_s\": " << r.wall_s
+          f << "    {\"party\": \"" << (p == 0 ? "client" : "server") << "\", \"phase\": \"" << r.name << "\", \"wall_s\": " << r.wall_s << ", \"wait_s\": " << r.wait_s
             << ", \"cpu_s\": " << r.cpu_s << ", \"main_sent\": " << r.main_sent << ", \"main_recv\": " << r.main_recv
             << ", \"ot_sent\": " << r.ot_sent << ", \"ot_recv\": " << r.ot_recv << ", \"main_flights\": " << r.main_flights
             << ", \"ot_flights_max\": " << r.ot_flights_max << ", \"ots\": " << r.ots << "}";

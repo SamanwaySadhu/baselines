@@ -5,6 +5,8 @@
 //   wall    elapsed time at this party (includes waiting for peers)
 //   cpu     CLOCK_PROCESS_CPUTIME_ID, summed over all of this party's threads (incl. the sender threads)
 //   sent[p] / recv[p]   bytes to / from party p (S0, S1, S2, client), frame headers included
+//   wait    wall time this party's protocol thread spent blocked in socket receives (needs the wan/libwanshim.so
+//           LD_PRELOAD, else 0); compute = wall - wait
 //   steps   communication steps: one Step::run() = one round in which the party sends its messages and
 //           receives the messages of that round (a send-only or receive-only round is also one step).
 //           All three servers execute the same step schedule, so the online steps of a server are the
@@ -25,6 +27,7 @@
 #include <vector>
 
 #include "net.h"
+#include "wan_wait.h"
 
 namespace fal {
 
@@ -54,7 +57,7 @@ inline std::string human_bytes(uint64_t bytes) {
 
 struct PhaseRow {
   char name[40];
-  double wall_s, cpu_s;
+  double wall_s, cpu_s, wait_s;
   uint64_t sent[NP], recv[NP];
   uint64_t steps;
   uint64_t calls;
@@ -65,10 +68,10 @@ class Recorder {
   explicit Recorder(const Net& n) : net_(n) {}
 
   struct Mark {
-    double wall = 0, cpu = 0;
+    double wall = 0, cpu = 0, wait = 0;
     Counters c;
   };
-  Mark now() const { return {wall_seconds(), cpu_seconds(), net_.counters()}; }
+  Mark now() const { return {wall_seconds(), cpu_seconds(), wan::wait_s(), net_.counters()}; }
 
   // Accumulate [m, now) into phase `name`, then advance m.
   void record(const char* name, Mark& m) {
@@ -83,6 +86,7 @@ class Recorder {
     }
     r->wall_s += n.wall - m.wall;
     r->cpu_s += n.cpu - m.cpu;
+    r->wait_s += n.wait - m.wait;
     for (int p = 0; p < NP; ++p) {
       r->sent[p] += n.c.sent[p] - m.c.sent[p];
       r->recv[p] += n.c.recv[p] - m.c.recv[p];
@@ -118,7 +122,7 @@ class Scope {
 };
 
 struct StageTotals {
-  double wall_s = 0, cpu_s = 0;
+  double wall_s = 0, cpu_s = 0, wait_s = 0;
   uint64_t sent[NP] = {0, 0, 0, 0}, recv[NP] = {0, 0, 0, 0};
   uint64_t steps = 0;
   uint64_t sent_total() const { return sent[0] + sent[1] + sent[2] + sent[3]; }
@@ -133,6 +137,7 @@ inline StageTotals stage_totals(const std::vector<PhaseRow>& rows, const char* s
     if (skip && std::strcmp(r.name, skip) == 0) continue;
     t.wall_s += r.wall_s;
     t.cpu_s += r.cpu_s;
+    t.wait_s += r.wait_s;
     for (int p = 0; p < NP; ++p) { t.sent[p] += r.sent[p]; t.recv[p] += r.recv[p]; }
     t.steps += r.steps;
   }

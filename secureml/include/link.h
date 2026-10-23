@@ -49,10 +49,11 @@ struct Link {
   std::vector<Worker> W;
   int nw() const { return (int)W.size(); }
 
-  // Server listens on port, port+1, ...; client connects. Both create channels in the same order.
-  Link(int me_, const std::string& host, int port, int nworkers, bool malicious) : me(me_), mal(malicious) {
+  // Server listens on port, port+1, ...; client connects (to connect_port, ... if given: a WAN proxy in front of the
+  // server, see wan/wanproxy). Both create channels in the same order.
+  Link(int me_, const std::string& host, int port, int nworkers, bool malicious, int connect_port = 0) : me(me_), mal(malicious) {
     auto make = [&](int p) -> std::unique_ptr<NetIO> {
-      return me == 1 ? NetIO::listen(p, true) : NetIO::connect(host.c_str(), p, true);
+      return me == 1 ? NetIO::listen(p, true) : NetIO::connect(host.c_str(), connect_port ? p - port + connect_port : p, true);
     };
     main = make(port);
     // Both parties use the smaller of the two requested worker counts (the OT connections pair up 1:1).

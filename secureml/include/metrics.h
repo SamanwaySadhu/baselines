@@ -4,6 +4,8 @@
 //   wall   elapsed time at this party
 //   cpu    CLOCK_PROCESS_CPUTIME_ID, summed over all of this party's threads (so a phase spread over
 //          N busy threads shows cpu ~ N * wall)
+//   wait   wall time this party's protocol thread (worker 0 in parallel phases) spent blocked in socket receives
+//          (needs the wan/libwanshim.so LD_PRELOAD, else 0); compute = wall - wait
 //   sent / recv    payload bytes on the main channel and on all worker (OT) channels
 //   flights        maximal runs of same-direction traffic. The main channel carries the protocol's
 //                  openings; a symmetric exchange is 2 flights = 1 round trip. For the worker
@@ -24,6 +26,7 @@
 #include <vector>
 
 #include "link.h"
+#include "wan_wait.h"
 
 namespace sml {
 
@@ -54,7 +57,7 @@ inline std::string human_bytes(uint64_t bytes) {
 // Plain-old-data so both parties can exchange their tables as raw bytes.
 struct PhaseRow {
   char name[40];
-  double wall_s, cpu_s;
+  double wall_s, cpu_s, wait_s;
   uint64_t main_sent, main_recv, ot_sent, ot_recv;
   uint64_t main_flights, ot_flights_sum, ot_flights_max;
   uint64_t ots;     // random OTs consumed
@@ -66,10 +69,10 @@ class Recorder {
   explicit Recorder(Link& l) : lk_(l) {}
 
   struct Mark {
-    double wall = 0, cpu = 0;
+    double wall = 0, cpu = 0, wait = 0;
     Link::Counters c;
   };
-  Mark now() const { return {wall_seconds(), cpu_seconds(), lk_.counters()}; }
+  Mark now() const { return {wall_seconds(), cpu_seconds(), wan::wait_s(), lk_.counters()}; }
 
   // Accumulate [m, now) into phase `name`, then advance m.
   void record(const char* name, Mark& m) {
@@ -84,6 +87,7 @@ class Recorder {
     }
     r->wall_s += n.wall - m.wall;
     r->cpu_s += n.cpu - m.cpu;
+    r->wait_s += n.wait - m.wait;
     r->main_sent += n.c.main_sent - m.c.main_sent;
     r->main_recv += n.c.main_recv - m.c.main_recv;
     r->ot_sent += n.c.w_sent - m.c.w_sent;
@@ -116,7 +120,7 @@ class Scope {
 };
 
 struct StageTotals {
-  double wall_s = 0, cpu_s = 0;
+  double wall_s = 0, cpu_s = 0, wait_s = 0;
   uint64_t sent = 0, recv = 0;                 // main + OT
   uint64_t main_flights = 0, ot_flights_max = 0, ots = 0;
 };
@@ -125,7 +129,7 @@ inline StageTotals stage_totals(const std::vector<PhaseRow>& rows, const char* s
   const size_t n = std::strlen(stage);
   for (const auto& r : rows) {
     if (std::strncmp(r.name, stage, n) != 0 || r.name[n] != '/') continue;
-    t.wall_s += r.wall_s; t.cpu_s += r.cpu_s;
+    t.wall_s += r.wall_s; t.cpu_s += r.cpu_s; t.wait_s += r.wait_s;
     t.sent += r.main_sent + r.ot_sent;
     t.recv += r.main_recv + r.ot_recv;
     t.main_flights += r.main_flights;
