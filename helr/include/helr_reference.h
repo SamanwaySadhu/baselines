@@ -141,23 +141,6 @@ inline std::vector<double> sigmoid_train(const Params& P, const Dataset& D, cons
   return beta;
 }
 
-// Largest |weight| the honest protocol can produce, rounded up to a power of two: each
-// iteration moves a weight by at most (B / K) * max|g| * max|z| and |g| <= ~ 2 on the fit
-// interval; the server rejects any output beyond this.
-inline double weight_bound(const Params& P) {
-  const double bound = 2.0 + (double)P.iters * P.batch * std::ldexp(1.0, -P.k_shift) * 2.0 * 2.0;
-  double b = 2.0;
-  while (b < bound) b *= 2.0;
-  return b;
-}
-
-// -log2 of the probability that a malicious client forges the decryption MAC of one weight
-// (helr_protocol.h): it must shift u1 by delta with |delta| <= 2 * weight_bound * 2^logp, and
-// succeeds with probability <= 2^(v + 1 - L) for delta with 2-adic valuation v, L = out_bits.
-inline double mac_forgery_bits(int out_bits, int logp, const Params& P) {
-  return (double)out_bits - ((double)logp + std::log2(weight_bound(P)) + 2.0);
-}
-
 }  // namespace lrhe
 
 #endif  // LRHE_HELR_REFERENCE_H

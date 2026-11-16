@@ -1,18 +1,23 @@
-# Baseline 4: HELR (homomorphic-encryption logistic regression), with malicious-security checks
+# Baseline 4: HELR (homomorphic-encryption logistic regression), semi-honest
 
 This baseline trains logistic regression the way **HELR** does it (Kim, Song, Wang, Xia, Jiang, *Secure Logistic
 Regression Based on Homomorphic Encryption: Design and Evaluation*, JMIR Med Inform 2018, ePrint 2018/074; code
 [K-miran/HELR](https://github.com/K-miran/HELR)): the data is encrypted under CKKS/HEAAN, and the server runs
-gradient descent **entirely on ciphertexts**, with the sigmoid replaced by a least-squares polynomial.
+gradient descent **entirely on ciphertexts**, with the sigmoid replaced by a least-squares polynomial. The protocol is the
+paper's: **semi-honest** secure outsourcing (its Fig. 1(a)); there is no malicious-security machinery (MACs, commitments,
+coin tossing, consistency checks, proofs). An earlier version of this baseline had that machinery; it was removed to match the paper.
 
 | role | holds | learns |
 |---|---|---|
-| **client** | training data (x, y), initial weights w0 (random for now), the HE secret key | nothing |
-| **server** | nothing | only the trained weights |
+| **client** | training data (x, y), initial weights w0 (random for now), the HE secret key | the trained weights (it is the decryptor, as in the paper) |
+| **server** | nothing | nothing but the sizes: it sees only ciphertexts and evaluation keys |
+
+As in the paper (and in baseline 6, `helr_han`), the data owner is the only party that can decrypt, so **the client, not the
+server, ends up with the model**. This differs from the secret-sharing / garbled-circuit baselines, where the server receives it.
 
 The training parameters are those of the other baselines: **20 iterations, batch 4, learning rate 0.5**, 6-bit quantized
 inputs, the bias as the last of the `--d` features. The data generator is baseline 1's: the same `--seed` gives the same
-data and initial weights in all four baselines.
+data and initial weights in all baselines.
 
 ## What is computed
 
@@ -46,11 +51,12 @@ beta = beta + (1/K) sum_{i in batch} g_i z_i,        K = batch / lr = 8
 
 ### Parameters
 
-HELR's: logp = 28 scaling bits, a fresh ciphertext modulus of `T * (3 logp) + (logp + 10 + mac_bits)` bits (3 levels of p per
-iteration at degree 3; `mac_bits` = 48 extra output bits for the decryption MAC), sparse ternary secret (h = 64), sigma = 3.2.
-The ring dimension is the smallest meeting `--lambda 128` by HELR's own formula `N >= (lambda + 110)/7.2 * log(qQ)` (with Q = q), which gives
-N = 2^17 for the default shape (log q = 1766, lambda ~ 157 by that formula). The formula is from 2012 and the sparse secret is
-weaker than a dense one; use the lattice estimator if you need a current figure. Ciphertexts are 2 x N x log q bits (58 MiB fresh).
+HELR's (`Test_HELR.cpp`, `LRtest.cpp`): logN = 17, logp = 28 scaling bits, output modulus `logp + logl` with logl = 10, a fresh
+ciphertext modulus of `T * (3 logp) + logp + 10` bits (3 levels of p per iteration at degree 3, 4 at degree 7), sparse ternary
+secret (h = 64), sigma = 3.2, `Params(logN, logq)` and HEAAN's key generation (uniform public-key element `a`). The ring
+dimension is the smallest meeting `--lambda 128` by HELR's own formula `N >= (lambda + 110)/7.2 * log(qQ)` (with Q = q), which gives
+N = 2^17 for the default shape (log q = 1718, lambda ~ 164 by that formula). The formula is from 2012 and the sparse secret is
+weaker than a dense one; use the lattice estimator if you need a current figure. Ciphertexts are 2 x N x log q bits (~56 MiB fresh).
 
 ## Install on WSL (Ubuntu 22.04/24.04)
 
@@ -59,77 +65,47 @@ sudo apt install -y build-essential cmake git libntl-dev libgmp-dev libssl-dev
 cd baselines/helr
 bash scripts/fetch_deps.sh      # HELR at a pinned commit + patches/heaan.patch -> third_party/HELR
 bash scripts/build.sh
-./build/lr_helr_selftest        # ~15 s: tiny INSECURE ring (N = 2^10); the circuit, MAC and protocol are the real code
+./build/lr_helr_selftest        # ~6 s: tiny INSECURE ring (N = 2^10); the circuit and protocol are the real code
 bash scripts/run_local.sh --d 3 --iters 3 --logn 11 --insecure     # the whole flow in seconds
 bash scripts/run_local.sh --d 2                                     # real parameters (N = 2^17): tens of minutes, ~4 GB per party
 ```
 
 By hand: `./build/lr_helr server --port 23456 --d 5` and `./build/lr_helr client --host <server-ip> --port 23456 --d 5`
 (same flags at both parties). Options: training `--d --iters --batch --qbits --lr --seed --no-bias --zero-init`; HE
-`--deg --logr --logp --logn --lambda --mac-bits --insecure`; protocol `--host --port --threads --tol`; output `--verify --json --csv --quiet`;
-test-only `--tamper`. `--help` has the details. The patch to HELR: an empty `PubKey` constructor (HELR's makes all 32
+`--deg --logr --logp --logn --lambda --insecure`; protocol `--host --port --threads`; output `--verify --tol --json --csv --quiet`.
+`--help` has the details. The patch to HELR: an empty `PubKey` constructor (HELR's makes all 32
 rotation keys, ~5 GB) and move constructors for `Cipher` / `Message`. Everything else in `third_party/HELR/src` is
 unmodified; the prebuilt `.o`/`.a` files in the upstream repository are not used.
 
 ## Protocol
 
 ```
-S -> C  com_S = H(sigma_S)                    coin toss for the public-key element a
-C -> S  header, sigma_C                       a = XOF(sigma_S || sigma_C)
-S -> C  sigma_S
-C -> S  UPLOAD  pk.b, mult key, rotation keys 2^0..2^(logn-1), d encrypted data columns, d encrypted w0     [offline]
+C -> S  UPLOAD  header, mult key, rotation keys 2^0..2^(logn-1), d encrypted data columns, d encrypted w0     [offline]
         server: HELR's gradient descent on ciphertexts, no interaction                                      [online]
-S -> C  c1_j (final weight j), c2_j = alpha_j c1_j + Enc_pk(r_j)          for every j < d
-C -> S  commitment to the decryptions (u1_j, u2_j) of c1_j and c2_j
-S -> C  seed_j (everything the server drew for c2_j)
-C -> S  opening: nonce and every (u1_j, u2_j)
-server: checks commitment, MAC and weight range; outputs w_j = u1_j / 2^logp
+S -> C  the d encrypted final weights
+client: decrypts (HELR's Scheme::decrypt, slot 0, divided by 2^logp)
 ```
+
+One flight in each direction. The header carries the public parameters so that a configuration mismatch fails loudly; it is not
+a security check. The server never receives the public key (evaluation does not use it).
 
 ## Security model
 
-**Read this before quoting the baseline as "malicious secure".** HE has no cheap analogue of the MAC checks of baselines 1
-and 2. Fully simulatable malicious security needs zero-knowledge proofs that the client's ciphertexts and evaluation keys are
-well formed (lattice proofs of plaintext knowledge and key validity) and verifiable evaluation. None of that is implemented here.
-What the baseline adds on top of HELR, and what it guarantees:
+**Semi-honest, exactly as in the paper.** Both parties follow the protocol and try to learn from what they see. The server sees
+only RLWE ciphertexts and evaluation keys under the client's key; privacy of the client's data and weights is the semantic
+security of the HE scheme (RLWE, sparse ternary secret, sigma = 3.2). The server has no input, so there is nothing for the client
+to learn about it. Nothing checks that either party followed the protocol: a malicious server could return wrong ciphertexts, and a
+malicious client could send ill-formed ciphertexts or keys. **Do not quote this baseline as malicious secure**; compare it with the
+semi-honest modes of the other baselines (e.g. `secureml --semi-honest`).
 
-**Against a malicious server (privacy of the client's data).**
-- The server sees only RLWE ciphertexts under the client's key, `pk.a` is jointly random (commit-and-reveal coin toss), and
-  nothing else of the client until the output phase.
-- The client never decrypts anything the server could use as a decryption oracle. It decrypts c1_j and c2_j internally, then
-  (i) checks that the decrypted weights are within `--tol` (default 2^-8) of the weights **it computes itself by running the same
-  training in the clear** (it owns the inputs; this costs microseconds against hours of HE), and (ii) commits to the decryptions.
-  Only after the server has revealed `seed_j` does it re-derive c2_j exactly (alpha_j, r_j, the encryption randomness) and compare; a c2 that is not
-  the honest MAC ciphertext of c1_j aborts the run with nothing released. Only then does it open.
-- Residual leakage: **one abort bit per run** (the server can make the client abort on a predicate of its choosing), and the
-  released u1_j may differ from the honest decryption by any amount below `--tol` (a server-chosen, data-dependent perturbation
-  inside the tolerance window: at most log2(tol * 2^logp) = 20 bits per weight beyond the output). Approximate-arithmetic HE cannot avoid
-  a window like this without proofs of correct evaluation.
-- The opening reveals one exact linear equation on the secret key per weight (coefficient 0 of the decryption of c1_j and of c2_j). The key is
-  fresh per run and sparse (h = 64) so d equations are far from enough to recover it for the supported d, but the equations are exact.
-  Do not extend the opening to more coefficients.
+What this baseline does *not* change from HELR: HELR's security estimate is the 2012 formula quoted above; its key generation uses
+NTL's generator (here seeded from the OS in every thread, since NTL's default seeding is deterministic); only the keys the circuit
+needs are generated (HELR's constructor makes ~5 GB of keys, see the patch), which changes key-generation time and upload size
+relative to the paper's numbers but not the evaluation.
 
-**Against a malicious client (integrity of the server's output).**
-- *Decryption MAC.* The client must report u1_j = Dec(c1_j)[0], the weight. The server sends c2_j = alpha_j * c1_j + Enc_pk(r_j) with a
-  fresh odd alpha_j and uniform mask r_j (all derived from seed_j), the client **commits to (u1_j, u2_j) before it learns alpha_j and r_j**, and the
-  server accepts only if `u2_j = alpha_j u1_j + r_j` up to the fresh-encryption noise bound. u2_j is uniform because of r_j, and c2_j hides alpha_j
-  under RLWE given a uniform `a` (hence the coin toss: a client-chosen `a` would let it read alpha_j off c2_j). A wrong u1_j needs
-  alpha_j * delta. Forging probability per weight is `<= 2^-(mac_bits+2)` = 2^-50 by default (`mac_forgery_bits`; the run refuses
-  parameters below 2^-40). The checks are exact: a forged shift of 1 is rejected (selftest [5]).
-- The server rejects any weight outside the range an honest run can produce, and any malformed ring element (padding bits).
-- **Not covered:** a malicious client can still send ciphertexts or evaluation keys that are not well formed, so the server's output is
-  guaranteed to be the decryption of *the server's own homomorphic computation on what the client sent*, not that it equals
-  the training on some in-range dataset. (Out-of-range inputs, or a malformed multiplication key, can steer the result.) Closing this needs the
-  zero-knowledge proofs above; their cost (several extra ciphertext-sized messages per batch) would be small next to the
-  evaluation, but the **security** claim of this baseline stops here. Equivalently: what is enforced is correctness of decryption and
-  privacy against a malicious server; input well-formedness is trusted.
-
-`lr_helr_selftest` runs every deviation it can: a client that lies about a weight (MAC), opens something else than it committed
-(commitment), a server that returns a wrong weight or a c2 not derived from its seed (client aborts, server gets nothing), a
-too-tight tolerance, mismatching parameters. `--tamper` does the same over TCP (exit code 3 = protocol abort).
-
-Other hardening of HELR's code: NTL's generator is seeded from the OS in every thread (HELR relies on NTL's default seeding),
-only the keys the circuit needs are generated, and every received ring element is length- and padding-checked.
+`lr_helr_selftest` checks: the polynomial fit against the paper's / HELR's constants, serialization, the HE circuit against the
+double-precision reference for degree 3 and 7 over several shapes, and the whole protocol in-process (decrypted weights, measured
+bytes against the analytic formulas, parameter mismatch).
 
 ## Metrics reported
 
@@ -137,49 +113,26 @@ The report has the same shape as baseline 3's: per party wall and process-CPU ti
 direction, flights, peak RSS, plus the server's HE operation counts and thread-seconds per operation class (mult, rotate, ...). The parties
 exchange their numbers at the end.
 
-- **Offline** = before the evaluation starts: coin toss, keygen, encryption, the client's plaintext run, one upload flight (keys, data, w0); the server's
-  setup and receive. **Online** = the HE evaluation and the output phase (MAC ciphertexts, 2 round trips). The HE evaluation itself is non-interactive.
-- The client's online time is dominated by waiting for the server's evaluation; its own online compute is decrypt + check + re-derive (reported separately).
+- **Offline** = before the evaluation starts: keygen, encryption, one upload flight (keys, data, w0); the server's
+  setup and receive. **Online** = the HE evaluation and returning the encrypted weights (one flight). The HE evaluation itself is non-interactive.
+- The client's online time is dominated by waiting for the server's evaluation; its own online compute is the decryption (reported separately).
 - Bytes are payload bytes (no TCP/IP headers) and equal the analytic formulas (`comm_layout`); the run prints `[measured == analytic]`.
+- `--verify` (client, test only) compares the decrypted weights with the plaintext polynomial training, the exact-sigmoid training
+  and the fixed-point baselines' training; it runs outside the measured phases.
 
 ## Results
 
-This laptop: Intel Core 7 150U (2 performance + 8 efficiency cores), WSL2 Ubuntu 24.04 with 7 GB RAM, localhost, NTL 11.5.1, OpenSSL 3.0.13.
-Defaults: N = 2^17, log q = 1766, degree 3, R = 8, 20 iterations, batch 4, 2 threads per party. One run, `--verify` passed.
-
-| d | 2 |
-|---|---|
-| client preprocessing (offline) | 31.3 s wall / 44.8 s cpu (HE context 8.3, keygen 11.6, encryption 4.8, upload 6.5) |
-| server preprocessing (offline) | 39.6 s wall / 15.6 s cpu (HE context 8.4, receive + deserialize 31.1) |
-| server online computation | 1918 s wall / 3894 s cpu (HE evaluation 1913 s, MAC + output 5 s) |
-| client online computation | 2.8 s own compute (decrypt, check, re-derive c2); 1916 s waiting for the server |
-| communication, offline | client->server 1.11 GiB (keys 912 MiB, data 110.5 MiB, w0 110.5 MiB), server->client 64 B |
-| communication, online | server->client 11.0 MiB (c1, c2 for 2 weights), client->server 108 B |
-| communication, total | 1.12 GiB (1,199,178,060 B), measured == analytic |
-| rounds | 4 offline flights (coin toss 3, upload 1) + 4 online flights (2 round trips); the evaluation is non-interactive |
-| peak RSS client / server | 1.9 GiB / 3.8 GiB |
-| accuracy | max abs deviation of the HE weights from the plaintext polynomial training 1.0e-4 (client tolerance 3.9e-3); 0.21 from exact-sigmoid training |
-
-Where the server's evaluation time goes (thread-seconds, 2 threads): rotations 2031 s (280 x 7.3 s), multiplications 1304 s
-(120 x 10.9 s), squares 171 s, plaintext masks 77 s. Iterations take 152 s at the top modulus and 59 s at the end.
-
-**Scaling with d (model, not measured).** Cost is linear in d: each feature costs ~1800 CPU-seconds (3 multiplications and 7
-rotations per iteration), plus a serial ~170 s, so `server evaluation wall ~ (1800 d + 170) / threads` seconds; communication is
-`~ 0.91 GiB + 0.11 GiB x d` (keys + 2 x 55 MiB per feature) offline and `5.5 MiB x d` online. Memory is ~1 GB of keys plus
-~110 MiB per feature plus ~1 GB per concurrent multiplication, so d = 5 fits this laptop (~4 GB per party) and d >= 20 needs a larger machine; only d = 2 was run here.
-`scripts/bench_sweep.sh` measures other d.
-
-The report ends with a SUMMARY block (preprocessing, online computation, total communication per party).
+@@RESULTS@@
 
 ## Files
 
 | file | contents |
 |---|---|
-| `src/lr_helr.cpp` | the two-party program: coin toss, offline upload, evaluation, output phase, report exchange, report, JSON/CSV, `--verify` |
-| `src/lr_helr_selftest.cpp` | polynomial fit, serialization, HE circuit vs the double-precision reference (deg 3 and 7, several shapes), MAC, full in-process protocol and every deviation |
-| `include/helr_protocol.h` | the protocol as state machines (`HeClient`, `HeServer`), the decryption MAC (`derive_c2`), commitments, analytic sizes |
+| `src/lr_helr.cpp` | the two-party program: offline upload, evaluation, output, report exchange, report, JSON/CSV, `--verify` |
+| `src/lr_helr_selftest.cpp` | polynomial fit, serialization, HE circuit vs the double-precision reference (deg 3 and 7, several shapes), full in-process protocol |
+| `include/helr_protocol.h` | the protocol as state machines (`HeClient`, `HeServer`), header, analytic sizes |
 | `include/helr_circuit.h` | HELR's homomorphic gradient descent (`Evaluator`), input encryption |
 | `include/helr_reference.h` | the least-squares polynomial, the circuit's function in double precision, the exact-sigmoid training |
-| `include/he_core.h` | parameter choice, OS-seeded randomness, key generation, ciphertext/key (de)serialization, coin-tossed `a` |
+| `include/he_core.h` | parameter choice, OS-seeded randomness, key generation, ciphertext/key (de)serialization, decryption |
 | `include/net.h`, `include/metrics.h`, `include/lr_params.h`, `include/lr_reference.h` | copies of baseline 3's channel / metrics / data generator, and baseline 1's fixed-point reference |
 | `patches/heaan.patch`, `scripts/` | patch to HELR's sources; `fetch_deps.sh`, `build.sh`, `run_local.sh`, `bench_sweep.sh` |

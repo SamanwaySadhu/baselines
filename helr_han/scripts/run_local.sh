@@ -12,11 +12,19 @@ BIN=build/lr_helr_han
 PORT="${PORT:-$(( (RANDOM % 15000) + 20000 ))}"
 mkdir -p results
 TH="--threads ${THREADS:-$(( ($(nproc) + 1) / 2 ))}"
+# WAN simulation (../wan/wan.sh): WAN_RTT_MS=50 [WAN_BW_MBPS=..] scripts/run_local.sh --d 5
+source ../wan/wan.sh
+trap wan_stop EXIT
+FRONT=$(( PORT + 100 ))
+wan_start "$FRONT:$PORT:1" || exit 1
+CP=""; [ "$WAN_ON" = 1 ] && CP="--connect-port $FRONT"
+[ -n "$WAN_PRELOAD" ] && export LD_PRELOAD="$WAN_PRELOAD"
 "$BIN" server --port "$PORT" $TH "$@" > results/server.log 2>&1 &
 SPID=$!
-"$BIN" client --port "$PORT" $TH --csv results/results.csv --json results/last_run.json "$@" > results/client.log 2>&1
+"$BIN" client --port "$PORT" $CP $TH --csv results/results.csv --json results/last_run.json "$@" > results/client.log 2>&1
 CRC=$?
 wait "$SPID"; SRC=$?
+unset LD_PRELOAD; wan_stop
 cat results/client.log
 echo "(client exit $CRC, server exit $SRC; server log: results/server.log)"
 exit $(( CRC | SRC ))

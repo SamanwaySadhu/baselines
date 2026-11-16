@@ -2,8 +2,8 @@ cmake_minimum_required(VERSION 3.16)
 project(lr_helr LANGUAGES CXX)
 
 # HELR baseline (Kim, Song, Wang, Xia, Jiang; JMIR Med Inform 2018): logistic-regression
-# training on CKKS/HEAAN ciphertexts, run as a client/server protocol with a decryption MAC
-# and a verified decryption. The HE library is HELR's own HEAAN snapshot
+# training on CKKS/HEAAN ciphertexts, run as the paper's semi-honest client/server
+# outsourcing protocol. The HE library is HELR's own HEAAN snapshot
 # (third_party/HELR/src, fetched and patched by scripts/fetch_deps.sh), built here from
 # source on top of NTL + GMP.
 
@@ -26,7 +26,7 @@ if(NOT EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/third_party/HELR/.patched)
   message(FATAL_ERROR "third_party/HELR is not patched: run scripts/fetch_deps.sh")
 endif()
 
-find_package(OpenSSL 3.0 REQUIRED)   # SHA-256, RAND_bytes
+find_package(OpenSSL 3.0 REQUIRED)   # RAND_bytes (OS randomness)
 find_package(Threads REQUIRED)
 find_library(NTL_LIBRARY ntl REQUIRED)
 find_library(GMP_LIBRARY gmp REQUIRED)
@@ -53,6 +53,6 @@ add_executable(lr_helr src/lr_helr.cpp)
 target_link_libraries(lr_helr PRIVATE helr_common)
 
 # Offline tests (no TCP): polynomial fit, serialization, HE circuit against the plaintext
-# reference, the full protocol in-process, and the malicious-behaviour cases.
+# reference, the full protocol in-process.
 add_executable(lr_helr_selftest src/lr_helr_selftest.cpp)
 target_link_libraries(lr_helr_selftest PRIVATE helr_common)

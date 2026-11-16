@@ -15,12 +15,14 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <algorithm>
 #include <cstring>
 #include <ctime>
 #include <string>
 #include <vector>
 
 #include "net.h"
+#include "wan_wait.h"
 
 namespace han {
 
@@ -57,7 +59,7 @@ inline std::string fmt_s(double s) {
 
 struct PhaseRow {
   char name[40];
-  double wall_s, cpu_s;
+  double wall_s, cpu_s, netwait_s;  // netwait: time the protocol thread was blocked in a socket receive (needs the WAN shim)
   uint64_t sent, recv, flights, calls;
 };
 
@@ -67,10 +69,10 @@ class Recorder {
   void attach(Channel* ch) { ch_ = ch; }
 
   struct Mark {
-    double wall = 0, cpu = 0;
+    double wall = 0, cpu = 0, nw = 0;
     NetCounters c;
   };
-  Mark now() const { return {wall_seconds(), cpu_seconds(), ch_ ? ch_->counters() : NetCounters{}}; }
+  Mark now() const { return {wall_seconds(), cpu_seconds(), wan::wait_s(), ch_ ? ch_->counters() : NetCounters{}}; }
 
   void record(const char* name, Mark& m) {
     const Mark n = now();
@@ -84,6 +86,7 @@ class Recorder {
     }
     r->wall_s += n.wall - m.wall;
     r->cpu_s += n.cpu - m.cpu;
+    r->netwait_s += n.nw - m.nw;
     r->sent += n.c.sent - m.c.sent;
     r->recv += n.c.recv - m.c.recv;
     r->flights += n.c.flights() - m.c.flights();
@@ -118,7 +121,7 @@ inline StageTotals stage_totals(const std::vector<PhaseRow>& rows, const char* s
   for (const auto& r : rows) {
     if (std::strncmp(r.name, stage, n) != 0 || r.name[n] != '/') continue;
     t.wall_s += r.wall_s; t.cpu_s += r.cpu_s;
-    if (std::strncmp(r.name + n + 1, "wait", 4) == 0) t.wait_s += r.wall_s;
+    t.wait_s += std::strncmp(r.name + n + 1, "wait", 4) == 0 ? r.wall_s : std::min(r.netwait_s, r.wall_s);
     t.sent += r.sent; t.recv += r.recv; t.flights += r.flights;
   }
   return t;

@@ -11,7 +11,7 @@
 //                   MD-ML's InputGate sends the 128-bit container)
 //   MulGate         Pi_OnlineArith multiplication / Pi_MultTrunc (paper Sec. 4.1):
 //                   one opening of the (k+s)-bit [Delta_z'], then local truncation by
-//                   `shift`. Matrix (Eigen) or element-wise. Same algorithm as MD-ML's
+//                   `shift`. Matrix (own multithreaded u128 product) or element-wise. Same algorithm as MD-ML's
 //                   MultiplyGate / ElemMultiplyGate, plus a run-time shift and MAC logging.
 //   LinearGate      any public linear map (+ public constant): local, no communication
 //   GeqZeroGate     z = (x >= 0) = 1 - LTZ(x), paper Pi_LTZ with the "LTZ right after

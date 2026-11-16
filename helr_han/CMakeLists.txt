@@ -29,8 +29,8 @@ target_compile_options(heaan PRIVATE -w -O3 -march=native)
 target_link_libraries(heaan PUBLIC ${NTL_LIBRARY} ${GMP_LIBRARY} Threads::Threads)
 
 add_library(han_common INTERFACE)
-target_include_directories(han_common INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_link_libraries(han_common INTERFACE heaan OpenSSL::Crypto Threads::Threads)
+target_include_directories(han_common INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/../wan)
+target_link_libraries(han_common INTERFACE heaan OpenSSL::Crypto Threads::Threads ${CMAKE_DL_LIBS})
 target_compile_options(han_common INTERFACE -Wall -Wextra -Wno-unused-parameter)
 
 add_executable(lr_helr_han src/lr_helr_han.cpp)

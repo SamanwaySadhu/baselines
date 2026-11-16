@@ -4,12 +4,11 @@
 // the ring is smaller, so a run takes seconds instead of hours.
 //
 //   [1] least-squares sigmoid polynomial against the constants of the paper / HELR
-//   [2] serialization of ciphertexts and keys; malformed encodings are rejected
-//   [3] randomness: independent NTL streams per thread; coin-tossed public-key element
+//   [2] serialization of ciphertexts and keys
+//   [3] randomness: independent NTL streams per thread
 //   [4] the HE training circuit against the double-precision reference, degree 3 and 7,
 //       several shapes (d, iterations, learning rate, R)
-//   [5] the decryption MAC (derive_c2) and its failure cases
-//   [6] the whole protocol in-process: honest run, and every deviation it must catch
+//   [5] the whole (semi-honest) protocol in-process: weights, byte counts, parameter mismatch
 //
 // usage: lr_helr_selftest [--quick]
 #include "helr_protocol.h"
@@ -57,14 +56,11 @@ HeOptions tiny_opts(int logN = 10, int deg = 3, int logR = -1) {
   return O;
 }
 
-// A context with keys for a configuration (no coin toss: pk.ax uniform).
+// A context with keys for a configuration.
 struct Rig {
   HeContext ctx;
   SecKey sk;
-  explicit Rig(const HeConfig& c) : ctx(c), sk(ctx.params) {
-    NumUtils::sampleUniform2(ctx.pk.ax, ctx.params.N, ctx.params.logq);
-    keygen(ctx, sk, 1);
-  }
+  explicit Rig(const HeConfig& c) : ctx(c), sk(ctx.params) { keygen(ctx, sk, 1); }
 };
 
 // ---------------------------------------------------------------------------------- [1]
@@ -125,14 +121,7 @@ void test_serialization() {
   CHECK(bytes.size() == cipher_bytes(C.N(), C.logq), "size %zu", bytes.size());
   Cipher c2 = cipher_from_bytes(bytes.data(), C.N(), C.logq, C.nslots);
   CHECK(cipher_to_bytes(c2, C.N()) == bytes, "round trip");
-  CHECK(decrypt_coeff(r.ctx, r.sk, c, 0) == decrypt_coeff(r.ctx, r.sk, c2, 0), "decryption differs after the round trip");
-  // padding bits: logq % 8 != 0 here, so the last byte of every coefficient has spare bits
-  CHECK(C.logq % 8 != 0, "test needs logq %% 8 != 0 (logq = %d)", C.logq);
-  auto bad = bytes;
-  bad[coeff_bytes(C.logq) - 1] |= 0x80;
-  bool threw = false;
-  try { cipher_from_bytes(bad.data(), C.N(), C.logq, C.nslots); } catch (const std::runtime_error&) { threw = true; }
-  CHECK(threw, "padding bits accepted");
+  CHECK(decrypt_weight(r.ctx, r.sk, c) == decrypt_weight(r.ctx, r.sk, c2), "decryption differs after the round trip");
   // a ciphertext with negative / unreduced coefficients serializes into [0, 2^cbits)
   Cipher neg = c;
   neg.ax.rep[3] = NTL::ZZ(-5);
@@ -154,13 +143,6 @@ void test_randomness() {
   CHECK(uniq.size() == 8, "tasks share a random stream (%zu distinct of 8)", uniq.size());
   const std::vector<uint8_t> a = os_random_bytes(32), b = os_random_bytes(32);
   CHECK(a != b, "os_random repeats");
-  // coin-tossed a: deterministic, depends on both seeds
-  const NTL::ZZX x = derive_pk_a(a, b, 64, 100), y = derive_pk_a(a, b, 64, 100), z = derive_pk_a(b, a, 64, 100);
-  CHECK(x == y, "derive_pk_a not deterministic");
-  CHECK(!(x == z), "derive_pk_a ignores the order of the seeds");
-  bool in_range = true;
-  for (long i = 0; i < 64; ++i) in_range &= x.rep[i] >= 0 && NTL::NumBits(x.rep[i]) <= 100;
-  CHECK(in_range, "derive_pk_a out of range");
 }
 
 // ---------------------------------------------------------------------------------- [4]
@@ -179,7 +161,7 @@ double circuit_error(const Params& P, const HeOptions& O, bool verbose, double* 
   double worst = 0;
   for (int j = 0; j < C.d; ++j) {
     CHECK(out[(size_t)j].cbits == C.out_bits, "output level %ld != %d", out[(size_t)j].cbits, C.out_bits);
-    const double he = zz_to_double(decrypt_coeff(r.ctx, r.sk, out[(size_t)j])) / std::ldexp(1.0, C.logp);
+    const double he = decrypt_weight(r.ctx, r.sk, out[(size_t)j]);
     worst = std::max(worst, std::fabs(he - ref[(size_t)j]));
     // every slot holds the same weight: slot 0 via the full decoder
     if (j == 0) {
@@ -214,82 +196,24 @@ void test_circuit(bool quick) {
 }
 
 // ---------------------------------------------------------------------------------- [5]
-void test_mac() {
-  std::printf("[5] decryption MAC\n");
-  const Params P = make_params(2, 2);
-  Rig r(make_he_config(P, tiny_opts()));
-  const HeConfig& C = r.ctx.cfg;
-  const long L = C.out_bits;
-  const NTL::ZZ mod = NTL::power2_ZZ(L);
-  // a ciphertext at the output level holding the weight 0.75 in every slot
-  Cipher c1 = encrypt_scaled(r.ctx, std::vector<NTL::ZZ>((size_t)C.nslots, scale_up(0.75, C.logp)));
-  r.ctx.scheme.modEmbedAndEqual(c1, C.logq - L);
-  const PkAtLevel pk = pk_at_level(r.ctx, L);
-  const NTL::ZZ E = enc_noise_bound(r.ctx);
-  int accepted = 0, rejected_shift = 0, rejected_alpha = 0, same = 0;
-  const int trials = 40;
-  for (int t = 0; t < trials; ++t) {
-    const auto seed = os_random_bytes(32);
-    MacSecret s;
-    const Cipher c2 = derive_c2(r.ctx, pk, c1, seed, &s);
-    same += cipher_to_bytes(derive_c2(r.ctx, pk, c1, seed, nullptr), C.N()) == cipher_to_bytes(c2, C.N());
-    const NTL::ZZ u1 = decrypt_coeff(r.ctx, r.sk, c1), u2 = decrypt_coeff(r.ctx, r.sk, c2);
-    CHECK(NTL::abs(u1 - scale_up(0.75, C.logp)) < 4096, "decryption of c1 off by %g", zz_to_double(u1 - scale_up(0.75, C.logp)));
-    // honest
-    NTL::ZZ D = center(u2 - s.alpha * u1 - s.r0, mod);
-    accepted += NTL::abs(D) <= E;
-    // a client that changes the weight by delta but cannot adjust u2
-    for (long dlt : {1L, 7L, 1L << 12, 1L << 20}) {
-      D = center(u2 - s.alpha * (u1 + dlt) - s.r0, mod);
-      rejected_shift += NTL::abs(D) > E;
-    }
-    // a client that guesses alpha wrongly: u2' = alpha' (u1 + delta) + (u2 - alpha u1)
-    const NTL::ZZ alpha_guess = (s.alpha + NTL::RandomBits_ZZ(L)) | NTL::ZZ(1);
-    const NTL::ZZ delta(1000);
-    const NTL::ZZ u2f = u2 + alpha_guess * delta;  // what the client would send
-    D = center(u2f - s.alpha * (u1 + delta) - s.r0, mod);
-    rejected_alpha += NTL::abs(D) > E;
-    // u2 is uniform: it does not reveal alpha (it is not, e.g., small)
-    CHECK(NTL::abs(center(u2, mod)) > NTL::power2_ZZ(L - 12) || t > 4, "u2 suspiciously small");
-  }
-  CHECK(accepted == trials, "honest MAC rejected (%d / %d)", accepted, trials);
-  CHECK(rejected_shift == 4 * trials, "forged shifts accepted (%d / %d rejected)", rejected_shift, 4 * trials);
-  CHECK(rejected_alpha == trials, "wrong-alpha forgery accepted (%d / %d rejected)", rejected_alpha, trials);
-  CHECK(same == trials, "derive_c2 is not deterministic in the seed");
-  // the noise bound is not vacuous: the honest |D| is far below E and E << 2^L
-  CHECK(E < NTL::power2_ZZ(30), "noise bound too large");
-  // different seeds give different (alpha, r)
-  MacSecret a, b;
-  derive_c2(r.ctx, pk, c1, os_random_bytes(32), &a);
-  derive_c2(r.ctx, pk, c1, os_random_bytes(32), &b);
-  CHECK(a.alpha != b.alpha && a.r0 != b.r0 && NTL::bit(a.alpha, 0) == 1 && NTL::bit(b.alpha, 0) == 1, "alpha/r repeat or alpha even");
-  std::printf("      %d honest checks accepted, %d forged shifts and %d wrong-alpha forgeries rejected; E = 2^%.1f, L = %ld\n",
-              accepted, rejected_shift, rejected_alpha, std::log2(zz_to_double(E)), L);
-}
-
-// ---------------------------------------------------------------------------------- [6]
 struct RunResult {
   bool client_ok = false, server_ok = false;
   std::string client_err, server_err;
-  std::vector<double> weights, expected;
+  std::vector<double> weights;
   uint64_t c2s = 0, s2c = 0;
 };
 
-RunResult run_protocol(const Params& P, const HeOptions& O, Tamper tc = {}, Tamper ts = {}, const Params* server_P = nullptr,
-                       double tol = -1) {
+RunResult run_protocol(const Params& P, const HeOptions& O, const Params* server_P = nullptr) {
   RunResult R;
   auto [cch, sch] = Channel::pair();
-  const HeOptions Os = O;
   std::thread server([&] {
     try {
       seed_ntl_from_os();
-      HeServer S(server_P ? *server_P : P, Os, ts);
+      HeServer S(server_P ? *server_P : P, O);
       S.setup();
-      S.coin_toss(*sch);
       S.receive(*sch);
       S.evaluate();
       S.output(*sch);
-      R.weights = S.weights();
       R.server_ok = true;
       R.s2c = sch->bytes_sent();
     } catch (const std::exception& e) {
@@ -300,13 +224,11 @@ RunResult run_protocol(const Params& P, const HeOptions& O, Tamper tc = {}, Tamp
   std::thread client([&] {
     try {
       seed_ntl_from_os();
-      HeClient C(P, O, generate_client_data(P), generate_initial_weights(P), tc);
-      if (tol > 0) C.tol = tol;
-      C.coin_toss(*cch);
+      HeClient C(P, O, generate_client_data(P), generate_initial_weights(P));
       C.setup();
       C.upload(*cch);
       C.output(*cch);
-      R.expected = C.expected();
+      R.weights = C.weights();
       R.client_ok = true;
       R.c2s = cch->bytes_sent();
     } catch (const std::exception& e) {
@@ -322,19 +244,22 @@ RunResult run_protocol(const Params& P, const HeOptions& O, Tamper tc = {}, Tamp
 bool contains(const std::string& s, const char* sub) { return s.find(sub) != std::string::npos; }
 
 void test_protocol(bool quick) {
-  std::printf("[6] full protocol in-process (logN = 10, insecure)\n");
+  std::printf("[5] full protocol in-process (logN = 10, insecure)\n");
   for (int deg : {3, 7}) {
     if (quick && deg == 7) break;
     const Params P = make_params(3, 3);
-    const RunResult R = run_protocol(P, tiny_opts(10, deg));
-    CHECK(R.client_ok && R.server_ok, "honest run failed: client [%s] server [%s]", R.client_err.c_str(), R.server_err.c_str());
+    const HeOptions O = tiny_opts(10, deg);
+    const RunResult R = run_protocol(P, O);
+    CHECK(R.client_ok && R.server_ok, "run failed: client [%s] server [%s]", R.client_err.c_str(), R.server_err.c_str());
     if (R.client_ok && R.server_ok) {
+      const HeConfig C = make_he_config(P, O);
+      const std::vector<double> ref =
+          poly_train(P, generate_client_data(P), generate_initial_weights(P), fit_sigmoid_poly(C.deg, C.logR));
       double worst = 0;
-      for (size_t j = 0; j < R.weights.size(); ++j) worst = std::max(worst, std::fabs(R.weights[j] - R.expected[j]));
-      CHECK(worst < 2e-3, "server weights differ from the plaintext run by %.3e", worst);
-      std::printf("      deg %d honest run: server weights within %.2e of the client's plaintext run; c->s %.1f KiB, s->c %.1f KiB\n",
+      for (size_t j = 0; j < R.weights.size(); ++j) worst = std::max(worst, std::fabs(R.weights[j] - ref[j]));
+      CHECK(worst < 2e-3, "client's decrypted weights differ from the plaintext run by %.3e", worst);
+      std::printf("      deg %d: decrypted weights within %.2e of the plaintext polynomial training; c->s %.1f KiB, s->c %.1f KiB\n",
                   deg, worst, R.c2s / 1024.0, R.s2c / 1024.0);
-      const HeConfig C = make_he_config(P, tiny_opts(10, deg));
       const CommLayout L = comm_layout(C);
       CHECK(R.c2s == L.offline_c2s() + L.online_c2s(), "client bytes %" PRIu64 " != analytic %" PRIu64, R.c2s,
             L.offline_c2s() + L.online_c2s());
@@ -342,34 +267,9 @@ void test_protocol(bool quick) {
             L.offline_s2c() + L.online_s2c());
     }
   }
-  const Params P = make_params(2, 2);
-  {  // the client lies about a weight (and commits to the lie): the MAC catches it
-    const RunResult R = run_protocol(P, tiny_opts(), Tamper{"opening"});
-    CHECK(!R.server_ok && contains(R.server_err, "MAC check failed"), "client lie not caught: [%s]", R.server_err.c_str());
-  }
-  {  // the client opens a value other than the one it committed to
-    const RunResult R = run_protocol(P, tiny_opts(), Tamper{"commit"});
-    CHECK(!R.server_ok && contains(R.server_err, "commitment"), "commitment break not caught: [%s]", R.server_err.c_str());
-  }
-  {  // the server returns a wrong weight: the client refuses to decrypt / release
-    const RunResult R = run_protocol(P, tiny_opts(), {}, Tamper{"c1"});
-    CHECK(!R.client_ok && contains(R.client_err, "differ from the client's own computation"), "server c1 not caught: [%s]",
-          R.client_err.c_str());
-    CHECK(!R.server_ok && R.weights.empty(), "server got an output although the client aborted");
-  }
-  {  // the server sends a c2 that is not the honest MAC ciphertext (a decryption oracle probe)
-    const RunResult R = run_protocol(P, tiny_opts(), {}, Tamper{"c2"});
-    CHECK(!R.client_ok && contains(R.client_err, "not the honest MAC ciphertext"), "server c2 not caught: [%s]", R.client_err.c_str());
-    CHECK(!R.server_ok && R.weights.empty(), "server got an output although the client aborted");
-  }
-  {  // a client tolerance that is too tight aborts an honest run (and releases nothing)
-    const RunResult R = run_protocol(P, tiny_opts(), {}, {}, nullptr, 1e-12);
-    CHECK(!R.client_ok && !R.server_ok && contains(R.client_err, "verification failed"), "tight tolerance: [%s]",
-          R.client_err.c_str());
-  }
   {  // disagreeing public parameters are caught at the first message
-    const Params Q = make_params(2, 3);
-    const RunResult R = run_protocol(P, tiny_opts(), {}, {}, &Q);
+    const Params P = make_params(2, 2), Q = make_params(2, 3);
+    const RunResult R = run_protocol(P, tiny_opts(), &Q);
     CHECK(!R.server_ok && contains(R.server_err, "disagree on iters"), "parameter mismatch: [%s]", R.server_err.c_str());
   }
 }
@@ -391,7 +291,6 @@ int main(int argc, char** argv) {
     test_serialization();
     test_randomness();
     test_circuit(quick);
-    test_mac();
     test_protocol(quick);
   } catch (const std::exception& e) {
     std::printf("EXCEPTION: %s\n", e.what());

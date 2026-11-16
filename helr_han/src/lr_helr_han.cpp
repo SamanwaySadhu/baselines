@@ -51,6 +51,9 @@ struct Options {
   std::string host = "127.0.0.1";
   int port = 12345;
   double tol = 1e-2;
+  bool verify = false;    // client re-runs the training in the clear and aborts on mismatch (NOT part of the paper)
+  bool validate = false;  // server/client scan every received key/ciphertext for unreduced values (NOT part of the paper)
+  int connect_port = 0;   // client dials this port instead of --port (WAN proxy)
   bool quiet = false;
   std::string json_path, csv_path;
   Tamper tamper;
@@ -84,6 +87,10 @@ void usage(const char* prog) {
       "protocol / network:\n"
       "  --host IP --port N           (default 127.0.0.1:12345)\n"
       "  --threads N                  worker threads (default: all hardware threads)\n"
+      "  --verify                     client: re-run the training in the clear and abort on mismatch (off by default;\n"
+      "                               not part of the paper)\n"
+      "  --validate                   scan received keys / ciphertexts for unreduced values (off by default)\n"
+      "  --connect-port N             client: dial this port (WAN proxy) instead of --port\n"
       "  --tol X                      client: abort if a decrypted weight differs from the plaintext\n"
       "                               computation by more than X (default 1e-2)\n\n"
       "output:\n"
@@ -107,6 +114,9 @@ Options parse_options(int argc, char** argv) {
     if (parse_param_flag(r, O.P)) continue;
     if (a == "--host") O.host = r.next_value(a);
     else if (a == "--port") O.port = (int)parse_int(r.next_value(a), a);
+    else if (a == "--verify") O.verify = true;
+    else if (a == "--validate") O.validate = true;
+    else if (a == "--connect-port") O.connect_port = (int)parse_int(r.next_value(a), a);
     else if (a == "--tol") O.tol = parse_double(r.next_value(a), a);
     else if (a == "--quiet") O.quiet = true;
     else if (a == "--json") O.json_path = r.next_value(a);
@@ -218,7 +228,7 @@ int main(int argc, char** argv) {
   try {
     init_threads(P.threads);
     seed_ntl();
-    std::unique_ptr<Channel> chp = O.role == 1 ? Channel::listen(O.port) : Channel::connect(O.host, O.port);
+    std::unique_ptr<Channel> chp = O.role == 1 ? Channel::listen(O.port) : Channel::connect(O.host, O.connect_port ? O.connect_port : O.port);
     Channel& ch = *chp;
     rec.attach(&ch);
     const Poly3 H = fit_sigmoid(P.range);
@@ -258,10 +268,12 @@ int main(int argc, char** argv) {
       RefResult ref, ref_exact;
       {
         Scope sc(rec, "other/plaintext_reference");  // the client's own plaintext training: used to check the server
-        ref = reference_train(P, D, H);
-        ref_exact = reference_train(P, D, H, true);
+        if (O.verify) {
+          ref = reference_train(P, D, H);
+          ref_exact = reference_train(P, D, H, true);
+        }
       }
-      if (ref.max_abs_u > P.range && !O.quiet) std::fprintf(stderr, "[client] note: |z.v| reached %.2f > %.1f, outside the polynomial's fitted range\n", ref.max_abs_u, P.range);
+      if (O.verify && ref.max_abs_u > P.range && !O.quiet) std::fprintf(stderr, "[client] note: |z.v| reached %.2f > %.1f, outside the polynomial's fitted range\n", ref.max_abs_u, P.range);
 
       std::unique_ptr<Ring> ring;
       std::unique_ptr<SecretKey> sk;
@@ -346,12 +358,12 @@ int main(int argc, char** argv) {
       {
         Scope sc(rec, "online/decrypt_verify");
         w = decrypt_weights(*scheme, *sk, Wf, P, &rep);
-        for (int j = 0; j < P.d; ++j) {
+        if (O.verify) for (int j = 0; j < P.d; ++j) {
           dev = std::max(dev, std::fabs(w[(size_t)j] - ref.w[(size_t)j]));
           dev_exact = std::max(dev_exact, std::fabs(w[(size_t)j] - ref_exact.w[(size_t)j]));
         }
-        for (int j = P.d; j < P.factorNum; ++j) dev = std::max(dev, std::fabs(w[(size_t)j]));  // padding weights stay 0
-        if (!(dev <= O.tol) || !(rep <= O.tol)) {
+        if (O.verify) for (int j = P.d; j < P.factorNum; ++j) dev = std::max(dev, std::fabs(w[(size_t)j]));  // padding weights stay 0
+        if (O.verify && (!(dev <= O.tol) || !(rep <= O.tol))) {
           char b[256];
           std::snprintf(b, sizeof b, "the decrypted weights differ from the client's own plaintext training by %.3g (replicas %.3g) > tolerance %.3g: the result is rejected and nothing is released", dev, rep, O.tol);
           throw AbortError(b);
@@ -364,7 +376,8 @@ int main(int argc, char** argv) {
       std::printf("trained weights (client, decrypted):");
       for (int j = 0; j < P.d && j < 8; ++j) std::printf(" %.5f", w[(size_t)j]);
       if (P.d > 8) std::printf(" ... (%d weights)", P.d);
-      std::printf("\nverify: max |HE - plaintext polynomial training| = %.3g (tolerance %.3g, replica spread %.2g); distance to exact-sigmoid training %.3g\n", dev, O.tol, rep, dev_exact);
+      if (O.verify) std::printf("\nverify: max |HE - plaintext polynomial training| = %.3g (tolerance %.3g, replica spread %.2g); distance to exact-sigmoid training %.3g\n", dev, O.tol, rep, dev_exact);
+      else std::printf("\nverify: OFF (no plaintext re-computation, no abort check, no key/ciphertext scans unless --validate)\n");
       print_phase_table(R, 0);
       print_phase_table(R, 1);
 
@@ -472,7 +485,7 @@ int main(int argc, char** argv) {
         bool have_mult = false, have_conj = false;
         for (uint64_t i = 0; i < nkeys; ++i) {
           uint64_t tag, idx;
-          std::unique_ptr<Key> k(recv_key(ch, *ring, tag, idx));
+          std::unique_ptr<Key> k(recv_key(ch, *ring, tag, idx, O.validate));
           if (tag == TAG_MULT && !have_mult) { have_mult = true; scheme->keyMap[MULTIPLICATION] = k.release(); }
           else if (tag == TAG_CONJ && !have_conj) { have_conj = true; scheme->keyMap[CONJUGATION] = k.release(); }
           else if (tag == TAG_ROT && std::binary_search(need.begin(), need.end(), (long)idx) && !have.count((long)idx)) {
@@ -486,10 +499,10 @@ int main(int argc, char** argv) {
       std::vector<std::vector<unsigned char>> zbuf((size_t)P.iters * P.cnum);
       {
         Scope sc(rec, "offline/receive_data");
-        for (auto& b : zbuf) { b = recv_ct_bytes(ch, z_shape); check_ct_padding(b, z_shape); }
+        for (auto& b : zbuf) { b = recv_ct_bytes(ch, z_shape); if (O.validate) check_ct_padding(b, z_shape); }
         std::vector<std::vector<unsigned char>> wb((size_t)P.cnum), vb((size_t)P.cnum);
-        for (auto& b : wb) { b = recv_ct_bytes(ch, w_shape); check_ct_padding(b, w_shape); }
-        for (auto& b : vb) { b = recv_ct_bytes(ch, w_shape); check_ct_padding(b, w_shape); }
+        for (auto& b : wb) { b = recv_ct_bytes(ch, w_shape); if (O.validate) check_ct_padding(b, w_shape); }
+        for (auto& b : vb) { b = recv_ct_bytes(ch, w_shape); if (O.validate) check_ct_padding(b, w_shape); }
         ev.W.resize((size_t)P.cnum);
         ev.V.resize((size_t)P.cnum);
         for (int j = 0; j < P.cnum; ++j) {

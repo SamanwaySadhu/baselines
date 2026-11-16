@@ -1,5 +1,5 @@
 // he_core.h -- the HEAAN layer of the HELR baseline: parameter selection, OS-seeded
-// randomness, key generation (only the keys the circuit uses, in parallel), strict
+// randomness, key generation (only the keys the circuit uses, in parallel),
 // (de)serialization of ciphertexts and keys, and a small thread helper.
 //
 // The scheme is HELR's snapshot of HEAAN (Cheon-Kim-Kim-Song, ASIACRYPT 2017): a
@@ -14,7 +14,6 @@
 #include "lr_params.h"
 #include "net.h"
 
-#include <openssl/evp.h>
 #include <openssl/rand.h>
 
 #include "Cipher.h"
@@ -132,12 +131,11 @@ struct HeConfig {
   int logN = 0;                  // ring dimension N = 2^logN
   int logp = 28;                 // scaling bits (HELR: 28)
   int deg = 3;                   // degree of the least-squares sigmoid polynomial: 3 or 7
-  int mac_bits = 48;             // extra modulus bits kept at the output for the decryption MAC
   int lambda = 128;              // target security level (HELR's formula, see lambda_est)
   int logR = 3;                  // the polynomial is fitted on [-R, R], R = 2^logR (HELR: 8)
   // derived
   int lev_iter = 0;              // modulus bits one iteration consumes: (deg == 3 ? 3 : 4) * logp
-  int out_bits = 0;              // modulus of the output ciphertexts: logp + 10 + mac_bits
+  int out_bits = 0;              // modulus of the output ciphertexts: logp + 10 (HELR: logl = 10)
   int logq = 0;                  // fresh-ciphertext modulus: T * lev_iter + out_bits
   int nrot = 0;                  // rotation keys 2^0 .. 2^(logn-1)
 
@@ -152,7 +150,7 @@ struct HeConfig {
 
   bool operator==(const HeConfig& o) const {
     return T == o.T && B == o.B && d == o.d && k_shift == o.k_shift && nslots == o.nslots && logN == o.logN &&
-           logp == o.logp && deg == o.deg && mac_bits == o.mac_bits && logR == o.logR && logq == o.logq;
+           logp == o.logp && deg == o.deg && logR == o.logR && logq == o.logq;
   }
 };
 
@@ -160,7 +158,6 @@ struct HeOptions {
   int logN = 0;        // 0 = smallest meeting `lambda`
   int logp = 28;
   int deg = 3;
-  int mac_bits = 48;
   int lambda = 128;
   int logR = -1;       // -1 = automatic from d (see auto_logR)
   int threads = 0;     // 0 = automatic: all cores, limited by memory (see auto_threads)
@@ -178,7 +175,6 @@ inline int auto_logR(int d) {
 inline HeConfig make_he_config(const Params& P, const HeOptions& O) {
   if (O.deg != 3 && O.deg != 7) throw std::invalid_argument("--deg must be 3 or 7");
   if (O.logp < 16 || O.logp > 40) throw std::invalid_argument("--logp must be in [16, 40]");
-  if (O.mac_bits < 24 || O.mac_bits > 200) throw std::invalid_argument("--mac-bits must be in [24, 200]");
   HeConfig C;
   C.T = P.iters;
   C.B = P.batch;
@@ -186,7 +182,6 @@ inline HeConfig make_he_config(const Params& P, const HeOptions& O) {
   C.k_shift = P.k_shift;
   C.logp = O.logp;
   C.deg = O.deg;
-  C.mac_bits = O.mac_bits;
   C.lambda = O.lambda;
   C.logR = O.logR >= 0 ? O.logR : auto_logR(P.d);
   if (C.logR > 20) throw std::invalid_argument("--logr too large");
@@ -197,7 +192,7 @@ inline HeConfig make_he_config(const Params& P, const HeOptions& O) {
   while ((1 << C.logn) < C.nslots) ++C.logn;
   C.nrot = C.logn;
   C.lev_iter = (C.deg == 3 ? 3 : 4) * C.logp;
-  C.out_bits = C.logp + 10 + C.mac_bits;
+  C.out_bits = C.logp + 10;
   C.logq = C.T * C.lev_iter + C.out_bits;
   if (O.logN > 0) {
     C.logN = O.logN;
@@ -205,9 +200,6 @@ inline HeConfig make_he_config(const Params& P, const HeOptions& O) {
     C.logN = 10;
     while (C.lambda_est() < C.lambda || (1L << C.logN) < 2L * C.nslots) ++C.logN;
   }
-  if (mac_forgery_bits(C.out_bits, C.logp, P) < 40)
-    throw std::invalid_argument("--mac-bits " + std::to_string(C.mac_bits) + " gives a decryption-MAC forgery probability of only 2^-" +
-                                std::to_string((int)mac_forgery_bits(C.out_bits, C.logp, P)) + " (need 2^-40); raise --mac-bits");
   if (C.logN < 6 || C.logN > 20) throw std::invalid_argument("--logn must be in [6, 20]");
   if (2L * C.nslots > C.N()) throw std::invalid_argument("too many slots for this ring dimension");
   if (!O.insecure_ok && C.lambda_est() < C.lambda)
@@ -257,7 +249,8 @@ inline void free_eval_keys(HeContext& c) {
 }
 
 // Key generation as in HELR's PubKey constructor, restricted to the keys the circuit needs:
-// the public key, the multiplication key and the left-rotation keys 2^0 .. 2^(nrot-1).
+// the public key (used by the client only), the multiplication key and the left-rotation keys
+// 2^0 .. 2^(nrot-1).
 // (No conjugation and no right-rotation keys; HELR's constructor makes ~5 GB of keys.)
 // The keys are independent, so they are generated in parallel.
 inline void keygen(HeContext& c, const SecKey& sk, int threads) {
@@ -268,10 +261,7 @@ inline void keygen(HeContext& c, const SecKey& sk, int threads) {
     ZZX ex;
     ZZX sx = sk.sx;
     if (task == 0) {
-      // pk.ax is NOT sampled here: the caller sets it to the jointly random element of the
-      // coin toss (derive_pk_a), so that the server's decryption MAC (helr_protocol.h) is
-      // sound even against a client that tries to choose a structured public key.
-      if (pk.ax.rep.length() != params.N) throw std::logic_error("keygen: pk.ax must be set first");
+      NumUtils::sampleUniform2(pk.ax, params.N, params.logq);
       NumUtils::sampleGauss(ex, params.N, params.sigma);
       Ring2Utils::mult(pk.bx, sx, pk.ax, params.q, params.N);
       Ring2Utils::sub(pk.bx, ex, pk.bx, params.q, params.N);
@@ -301,7 +291,7 @@ inline void keygen(HeContext& c, const SecKey& sk, int threads) {
 
 // ---------------------------------------------------------------- serialization
 // A ring element over Z_{2^bits}: N coefficients, each ceil(bits/8) bytes little-endian,
-// reduced into [0, 2^bits). The receiver rejects any element with set padding bits.
+// reduced into [0, 2^bits).
 inline size_t coeff_bytes(long bits) { return (size_t)((bits + 7) / 8); }
 inline size_t elem_bytes(long N, long bits) { return (size_t)N * coeff_bytes(bits); }
 
@@ -316,12 +306,9 @@ inline void put_elem(uint8_t* out, const NTL::ZZX& x, long N, const NTL::ZZ& mod
 }
 inline void get_elem(const uint8_t* in, NTL::ZZX& x, long N, long bits) {
   const size_t nb = coeff_bytes(bits);
-  const int pad = (int)(nb * 8 - (size_t)bits);
   x.SetLength(N);
   for (long i = 0; i < N; ++i) {
-    const uint8_t* p = in + (size_t)i * nb;
-    if (pad && (p[nb - 1] >> (8 - pad)) != 0) throw std::runtime_error("malformed ring element (padding bits set)");
-    NTL::ZZFromBytes(x.rep[i], p, (long)nb);
+    NTL::ZZFromBytes(x.rep[i], in + (size_t)i * nb, (long)nb);
   }
 }
 
@@ -351,41 +338,35 @@ inline Cipher recv_cipher(Channel& ch, long N, long bits, long slots) {
   return cipher_from_bytes(b.data(), N, bits, slots);
 }
 
-// Key material, in this order: the public key's bx (one element mod q; its ax is the
-// coin-tossed element both parties derive), the multiplication key and the nrot
-// left-rotation keys (2 elements each, mod q^2).
-inline uint64_t keys_bytes(const HeConfig& c) {
-  return (uint64_t)elem_bytes(c.N(), c.logq) + (uint64_t)(1 + c.nrot) * cipher_bytes(c.N(), 2L * c.logq);
-}
+// Evaluation keys, in this order: the multiplication key and the nrot left-rotation keys (2
+// elements each, mod q^2). The server never needs the public key: it only evaluates.
+inline uint64_t keys_bytes(const HeConfig& c) { return (uint64_t)(1 + c.nrot) * cipher_bytes(c.N(), 2L * c.logq); }
 inline void send_keys(Channel& ch, HeContext& c) {
   const ::Params& p = c.params;
   const long N = p.N;
-  auto put1 = [&](const NTL::ZZX& a, const NTL::ZZ& mod, long bits) {
-    std::vector<uint8_t> buf(elem_bytes(N, bits));
-    put_elem(buf.data(), a, N, mod, bits);
+  auto put1 = [&](const NTL::ZZX& a) {
+    std::vector<uint8_t> buf(elem_bytes(N, p.logqq));
+    put_elem(buf.data(), a, N, p.qq, p.logqq);
     ch.send_bytes(buf);
   };
-  put1(c.pk.bx, p.q, p.logq);
-  put1(c.pk.axStar, p.qq, p.logqq);
-  put1(c.pk.bxStar, p.qq, p.logqq);
+  put1(c.pk.axStar);
+  put1(c.pk.bxStar);
   for (int i = 0; i < c.cfg.nrot; ++i) {
-    put1(c.pk.axLeftRot[i], p.qq, p.logqq);
-    put1(c.pk.bxLeftRot[i], p.qq, p.logqq);
+    put1(c.pk.axLeftRot[i]);
+    put1(c.pk.bxLeftRot[i]);
   }
 }
-// pk.ax must already be set (derive_pk_a).
 inline void recv_keys(Channel& ch, HeContext& c) {
   const long N = c.params.N;
-  auto get1 = [&](NTL::ZZX& a, long bits) {
-    const auto buf = ch.recv_bytes(elem_bytes(N, bits));
-    get_elem(buf.data(), a, N, bits);
+  auto get1 = [&](NTL::ZZX& a) {
+    const auto buf = ch.recv_bytes(elem_bytes(N, c.params.logqq));
+    get_elem(buf.data(), a, N, c.params.logqq);
   };
-  get1(c.pk.bx, c.params.logq);
-  get1(c.pk.axStar, c.params.logqq);
-  get1(c.pk.bxStar, c.params.logqq);
+  get1(c.pk.axStar);
+  get1(c.pk.bxStar);
   for (int i = 0; i < c.cfg.nrot; ++i) {
-    get1(c.pk.axLeftRot[i], c.params.logqq);
-    get1(c.pk.bxLeftRot[i], c.params.logqq);
+    get1(c.pk.axLeftRot[i]);
+    get1(c.pk.bxLeftRot[i]);
   }
 }
 
@@ -419,63 +400,19 @@ inline Message encode_scaled(HeContext& c, const std::vector<NTL::ZZ>& v) {
   return m;
 }
 
-// Centered coefficient i of the decryption polynomial of `ct`: bx + ax*sx mod 2^cbits, in
-// (-2^(cbits-1), 2^(cbits-1)]. For a ciphertext whose slots all hold the same real v this
-// is round(v * 2^logp) + noise at i = 0 (the other coefficients on the slot grid are pure noise).
-inline NTL::ZZ decrypt_coeff(HeContext& c, const SecKey& sk, const Cipher& ct, long i = 0) {
-  Message m = c.scheme.decryptMsg(const_cast<SecKey&>(sk), const_cast<Cipher&>(ct));
-  NTL::ZZ v = m.mx.rep[i] % ct.mod;
-  if (v >= (ct.mod >> 1)) v -= ct.mod;
-  return v;
-}
-
 inline double zz_to_double(const NTL::ZZ& z) {
   double d;
   NTL::conv(d, z);
   return d;
 }
 
-// ------------------------------------------------------------------ SHA-256
-class Sha256 {
- public:
-  Sha256() : c_(EVP_MD_CTX_new()) {
-    if (!c_ || EVP_DigestInit_ex(c_, EVP_sha256(), nullptr) != 1) throw std::runtime_error("SHA-256 init failed");
-  }
-  ~Sha256() { EVP_MD_CTX_free(c_); }
-  Sha256(const Sha256&) = delete;
-  Sha256& operator=(const Sha256&) = delete;
-  Sha256& update(const void* p, size_t n) {
-    if (EVP_DigestUpdate(c_, p, n) != 1) throw std::runtime_error("SHA-256 update failed");
-    return *this;
-  }
-  Sha256& update(const std::vector<uint8_t>& v) { return update(v.data(), v.size()); }
-  Sha256& update(const char* s) { return update(s, std::strlen(s)); }
-  std::vector<uint8_t> final() {
-    std::vector<uint8_t> out(32);
-    unsigned len = 0;
-    if (EVP_DigestFinal_ex(c_, out.data(), &len) != 1 || len != 32) throw std::runtime_error("SHA-256 final failed");
-    return out;
-  }
-
- private:
-  EVP_MD_CTX* c_;
-};
-
-// The jointly random public-key element a of the coin toss: both parties derive it from
-// the server's committed seed and the client's seed. NTL's generator (ChaCha20 keyed by
-// the SHA-256 of the two seeds) expands it; the sampling is integer-only, so it is the
-// same on every platform.
-inline NTL::ZZX derive_pk_a(const std::vector<uint8_t>& seed_server, const std::vector<uint8_t>& seed_client, long N,
-                            long logq) {
-  Sha256 h;
-  h.update("HELR-pk-a").update(seed_server).update(seed_client);
-  const std::vector<uint8_t> key = h.final();
-  NTL::RandomStreamPush push;
-  NTL::SetSeed(key.data(), (long)key.size());
-  NTL::ZZX a;
-  a.SetLength(N);
-  for (long i = 0; i < N; ++i) a.rep[i] = NTL::RandomBits_ZZ(logq);
-  return a;
+// Decrypt a ciphertext whose slots all hold the same weight (the output of AllSum) and return
+// it as a real: HELR's decryption (Scheme::decrypt, slot 0), divided by 2^logp.
+inline double decrypt_weight(HeContext& c, const SecKey& sk, const Cipher& ct) {
+  CZZ* m = c.scheme.decrypt(const_cast<SecKey&>(sk), const_cast<Cipher&>(ct));
+  const double v = std::ldexp(zz_to_double(m[0].r), -c.cfg.logp);
+  delete[] m;
+  return v;
 }
 
 }  // namespace lrhe

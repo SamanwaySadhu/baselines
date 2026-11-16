@@ -45,7 +45,7 @@ compare costs, not model bits.
 - SPDZ2k share types and the dealer's share and MAC generation (`FakeParty`)
 - the gate framework (`Gate` / `FakeGate`, with Delta / lambda wires and the fake-offline file pipeline)
 - `FakeInputGate`, `FakeMultiplyGate` and `FakeElemMultiplyGate`
-- Eigen-based matrix multiplication
+- Eigen-based matrix multiplication, on the dealer side only (`FakeMultiplyGate` computes `c = a*b` with it)
 
 **Patched** (`patches/mdml-network.patch`, two small changes to `Party.cpp`):
 - the peer address comes from `MDML_PEER_HOST` (it was hard-coded to 127.0.0.1)
@@ -71,7 +71,9 @@ research prototype: it has no logistic regression, and several protocol pieces a
     paper's formula.
 - **Output to the server only.** The repo's `OutputGate` opens the result to both parties. Here the
   parties open `[lambda_w] - [r]`, where only the server knows r.
-- **Multiply-then-truncate with any shift.** The repo fixes the shift at 16 bits; the update needs F + k.
+- **Multiply-then-truncate with any shift.** The repo fixes the shift at 16 bits; the update needs F + k. The online
+  `MulGate` re-implements `MultiplyGate`'s algorithm (same preprocessing order, same opened values and MACs) with its
+  own multithreaded u128 matrix product instead of the Eigen one.
 - **Local linear gates** for transpose, stacking, slicing and constants. The repo's `SubtractGate` desyncs
   the preprocessing files.
 - **Inputs send k = 64 bits per element.** The repo's `InputGate` sends the 128-bit container.

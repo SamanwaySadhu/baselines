@@ -97,7 +97,7 @@ inline void send_key(Channel& ch, uint64_t tag, uint64_t idx, const Key& k) {
 
 // Receives one key and validates it against the receiver's own ring: the declared dimensions must be the
 // expected ones (so the sizes are not attacker-controlled) and every NTT residue must be reduced.
-inline Key* recv_key(Channel& ch, const Ring& ring, uint64_t& tag, uint64_t& idx) {
+inline Key* recv_key(Channel& ch, const Ring& ring, uint64_t& tag, uint64_t& idx, bool validate = true) {
   uint64_t hdr[4];
   ch.recv(hdr, sizeof hdr);
   tag = hdr[0]; idx = hdr[1];
@@ -109,7 +109,7 @@ inline Key* recv_key(Channel& ch, const Ring& ring, uint64_t& tag, uint64_t& idx
   ch.recv(ra.get(), cnt * sizeof(uint64_t));
   ch.recv(rb.get(), cnt * sizeof(uint64_t));
   std::atomic<bool> bad{false};
-  par_for(np, [&](long i) {
+  if (validate) par_for(np, [&](long i) {
     const uint64_t p = ring.multiplier.pVec[i];
     const uint64_t* a = ra.get() + (size_t)i * ring.N;
     const uint64_t* b = rb.get() + (size_t)i * ring.N;
