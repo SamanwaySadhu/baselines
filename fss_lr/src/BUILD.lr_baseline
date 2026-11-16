@@ -1,0 +1,16 @@
+# Benchmark driver for the Agarwal et al. secure logistic regression code.
+# Lives in fss_machine_learning/applications/lr_baseline (scripts/fetch_deps.sh copies it there).
+package(default_visibility = ["//visibility:public"])
+
+cc_binary(
+    name = "lr_fss",
+    srcs = ["lr_fss.cc"],
+    linkopts = ["-pthread"],
+    deps = [
+        "//applications/logistic_regression:gradient_descent",
+        "//applications/secure_sigmoid",
+        "//applications/secure_sigmoid_new_mic",
+        "//poisson_regression:beaver_triple_utils",
+        "//secret_sharing_mpc/gates:correlated_matrix_product",
+    ],
+)

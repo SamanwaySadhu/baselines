@@ -1,0 +1,128 @@
+######## v1 RTT=0
+
+=== lr_fss: variant v1 (MIC sigmoid, 4 sigmoid rounds), 80 rows d=5 iters=20 x batch 4  link: RTT 0.0 ms, bandwidth unlimited  threads/party=6 dealer=12 chunks=1 ===
+
+OFFLINE (data independent except input sharing; dealer = data owner)
+                                                 data owner            analyst
+  CPU time, all threads (s)                           0.124              0.000
+  wall time (s)                                       0.014              0.014
+  wait: for the peer to send (s)                      0.000              0.014
+  wait: network latency/transfer (s)                  0.000              0.000
+  compute wall = wall - all waits (s)                 0.014              0.000
+  bytes sent                                      12.85 KiB                0 B
+  bytes received                                        0 B          12.85 KiB
+  rounds of interaction                                   1                  1
+
+ONLINE
+                                                 data owner            analyst
+  CPU time, all threads (s)                           0.040              0.040
+  wall time (s)                                       0.043              0.043
+  wait: for the peer to send (s)                      0.007              0.008
+  wait: network latency/transfer (s)                  0.000              0.000
+  compute wall = wall - all waits (s)                 0.036              0.035
+  bytes sent                                      32.49 KiB          32.45 KiB
+  bytes received                                  32.45 KiB          32.49 KiB
+  rounds of interaction                                 121                121
+
+online rounds = 20 x (1 [X-A, X^T-A, theta-B] + 4 sigmoid + 1 [gradient]) + 1 (reveal to analyst) = 121
+online wall (owner/analyst) = 0.043 s / 0.043 s;  latency alone at 0 ms RTT = rounds x RTT/2 = 0.000 s
+total wall (offline+online) 0.060 s;  peak RSS 19.0 MiB (both parties, one process)
+paper's analytic offline cost per sigmoid (Sec. 7.1, NOT measured here): v1 FSS material stored per party = 3.0 KiB  ->  x 80 sigmoids = 236.00 KiB
+model check: max |theta_secure - theta_plaintext_double| = 7.25e-05;  train accuracy secure 0.7375 vs plaintext 0.7375
+analyst's model (first 5 of 5): 0.57079 0.53254 1.33955 -0.48208 -0.98883
+######## v1 RTT=50
+
+=== lr_fss: variant v1 (MIC sigmoid, 4 sigmoid rounds), 80 rows d=5 iters=20 x batch 4  link: RTT 50.0 ms, bandwidth unlimited  threads/party=6 dealer=12 chunks=1 ===
+
+OFFLINE (data independent except input sharing; dealer = data owner)
+                                                 data owner            analyst
+  CPU time, all threads (s)                           0.132              0.000
+  wall time (s)                                       0.015              0.040
+  wait: for the peer to send (s)                      0.000              0.015
+  wait: network latency/transfer (s)                  0.000              0.025
+  compute wall = wall - all waits (s)                 0.015              0.000
+  bytes sent                                      12.85 KiB                0 B
+  bytes received                                        0 B          12.85 KiB
+  rounds of interaction                                   1                  1
+
+ONLINE
+                                                 data owner            analyst
+  CPU time, all threads (s)                           0.108              0.111
+  wall time (s)                                       3.105              3.130
+  wait: for the peer to send (s)                      0.066              0.066
+  wait: network latency/transfer (s)                  2.949              2.972
+  compute wall = wall - all waits (s)                 0.091              0.093
+  bytes sent                                      32.50 KiB          32.46 KiB
+  bytes received                                  32.46 KiB          32.50 KiB
+  rounds of interaction                                 121                121
+
+online rounds = 20 x (1 [X-A, X^T-A, theta-B] + 4 sigmoid + 1 [gradient]) + 1 (reveal to analyst) = 121
+online wall (owner/analyst) = 3.105 s / 3.130 s;  latency alone at 50 ms RTT = rounds x RTT/2 = 3.025 s
+total wall (offline+online) 3.171 s;  peak RSS 18.9 MiB (both parties, one process)
+paper's analytic offline cost per sigmoid (Sec. 7.1, NOT measured here): v1 FSS material stored per party = 3.0 KiB  ->  x 80 sigmoids = 236.00 KiB
+model check: max |theta_secure - theta_plaintext_double| = 6.20e-05;  train accuracy secure 0.7375 vs plaintext 0.7375
+analyst's model (first 5 of 5): 0.57078 0.53253 1.33954 -0.48208 -0.98881
+######## v2 RTT=0
+
+=== lr_fss: variant v2 (comparison sigmoid, 6 sigmoid rounds), 80 rows d=5 iters=20 x batch 4  link: RTT 0.0 ms, bandwidth unlimited  threads/party=6 dealer=12 chunks=1 ===
+
+OFFLINE (data independent except input sharing; dealer = data owner)
+                                                 data owner            analyst
+  CPU time, all threads (s)                           0.590              0.000
+  wall time (s)                                       0.056              0.057
+  wait: for the peer to send (s)                      0.000              0.056
+  wait: network latency/transfer (s)                  0.000              0.000
+  compute wall = wall - all waits (s)                 0.056              0.000
+  bytes sent                                      12.85 KiB                0 B
+  bytes received                                        0 B          12.85 KiB
+  rounds of interaction                                   1                  1
+
+ONLINE
+                                                 data owner            analyst
+  CPU time, all threads (s)                           0.052              0.053
+  wall time (s)                                       0.057              0.057
+  wait: for the peer to send (s)                      0.010              0.009
+  wait: network latency/transfer (s)                  0.000              0.000
+  compute wall = wall - all waits (s)                 0.046              0.048
+  bytes sent                                      61.55 KiB          61.50 KiB
+  bytes received                                  61.50 KiB          61.55 KiB
+  rounds of interaction                                 161                161
+
+online rounds = 20 x (1 [X-A, X^T-A, theta-B] + 6 sigmoid + 1 [gradient]) + 1 (reveal to analyst) = 161
+online wall (owner/analyst) = 0.057 s / 0.057 s;  latency alone at 0 ms RTT = rounds x RTT/2 = 0.000 s
+total wall (offline+online) 0.119 s;  peak RSS 49.6 MiB (both parties, one process)
+paper's analytic offline cost per sigmoid (Sec. 7.1, NOT measured here): v2 offline communication of the 2PC offline phase = 205.0 KiB  ->  x 80 sigmoids = 16.02 MiB
+model check: max |theta_secure - theta_plaintext_double| = 8.49e-05;  train accuracy secure 0.7375 vs plaintext 0.7375
+analyst's model (first 5 of 5): 0.57078 0.53252 1.33956 -0.48208 -0.98883
+######## v2 RTT=50
+
+=== lr_fss: variant v2 (comparison sigmoid, 6 sigmoid rounds), 80 rows d=5 iters=20 x batch 4  link: RTT 50.0 ms, bandwidth unlimited  threads/party=6 dealer=12 chunks=1 ===
+
+OFFLINE (data independent except input sharing; dealer = data owner)
+                                                 data owner            analyst
+  CPU time, all threads (s)                           0.740              0.000
+  wall time (s)                                       0.069              0.094
+  wait: for the peer to send (s)                      0.000              0.069
+  wait: network latency/transfer (s)                  0.000              0.025
+  compute wall = wall - all waits (s)                 0.069              0.000
+  bytes sent                                      12.85 KiB                0 B
+  bytes received                                        0 B          12.85 KiB
+  rounds of interaction                                   1                  1
+
+ONLINE
+                                                 data owner            analyst
+  CPU time, all threads (s)                           0.122              0.105
+  wall time (s)                                       4.166              4.191
+  wait: for the peer to send (s)                      0.909              0.971
+  wait: network latency/transfer (s)                  3.154              3.133
+  compute wall = wall - all waits (s)                 0.103              0.088
+  bytes sent                                      61.58 KiB          61.57 KiB
+  bytes received                                  61.57 KiB          61.58 KiB
+  rounds of interaction                                 161                161
+
+online rounds = 20 x (1 [X-A, X^T-A, theta-B] + 6 sigmoid + 1 [gradient]) + 1 (reveal to analyst) = 161
+online wall (owner/analyst) = 4.166 s / 4.191 s;  latency alone at 50 ms RTT = rounds x RTT/2 = 4.025 s
+total wall (offline+online) 4.286 s;  peak RSS 49.2 MiB (both parties, one process)
+paper's analytic offline cost per sigmoid (Sec. 7.1, NOT measured here): v2 offline communication of the 2PC offline phase = 205.0 KiB  ->  x 80 sigmoids = 16.02 MiB
+model check: max |theta_secure - theta_plaintext_double| = 7.25e-05;  train accuracy secure 0.7375 vs plaintext 0.7375
+analyst's model (first 5 of 5): 0.57079 0.53254 1.33955 -0.48210 -0.98882

@@ -1,0 +1,12 @@
+{
+  "variant": 2, "n": 80, "d": 5, "iters": 20, "batch": 4, "rtt_ms": 50, "bw_mbps": 0, "threads": 6, "dealer_threads": 12, "chunks": 1,
+  "owner": {
+    "offline": {"wall_s": 0.068789, "cpu_s": 0.739943, "wait_peer_s": 0.000000, "wait_net_s": 0.000000, "sent_bytes": 13160, "recv_bytes": 0, "rounds": 1},
+    "online": {"wall_s": 4.166456, "cpu_s": 0.122257, "wait_peer_s": 0.909488, "wait_net_s": 3.153591, "sent_bytes": 63058, "recv_bytes": 63046, "rounds": 161}
+  },
+  "analyst": {
+    "offline": {"wall_s": 0.094060, "cpu_s": 0.000243, "wait_peer_s": 0.068758, "wait_net_s": 0.025157, "sent_bytes": 0, "recv_bytes": 13160, "rounds": 1},
+    "online": {"wall_s": 4.191470, "cpu_s": 0.104985, "wait_peer_s": 0.971020, "wait_net_s": 3.132750, "sent_bytes": 63046, "recv_bytes": 63058, "rounds": 161}
+  },
+  "total_wall_s": 4.285961, "max_abs_theta_diff": 7.2539e-05, "accuracy": 0.7375, "accuracy_plaintext": 0.7375, "peak_rss_kib": 50432
+}
