@@ -2,15 +2,16 @@
 // scripts/test_tamper.sh, because emp-agmpc keeps process-wide state):
 //   1. GF(2^128) doubling (known answers) and the invertibility of the garbling-hash input maps 2, 4, 6 and
 //      their xors with the identity (3, 5, 7): PATCHES.md P1 relies on all six having full rank.
-//   2. The per-iteration circuits and their segmentation: plaintext evaluation of the chained segments equals
-//      reference_train bit for bit, for many configurations and segment sizes; AND counts equal gc_ag2pc's.
-//   lr_gc_agmpc_selftest [--quick]
+//   2. The float32 per-iteration circuits and their segmentation: plaintext evaluation of the chained segments equals
+//      reference_train bit for bit, for several dimensions and segment sizes (needs the circuit files).
+//   lr_gc_agmpc_selftest [--quick] [--circuits DIR]
 #include "emp-agmpc/cmpc_config.h"
 #include "lr_agmpc_circuit.h"
 
 #include <array>
 #include <cinttypes>
 #include <functional>
+#include <string>
 #include <cstdio>
 
 using namespace lrgc;
@@ -73,23 +74,22 @@ static void test_gf() {
   std::printf("  upstream sigma ^ sigma^2 ^ identity: rank %d (= 0, i.e. sigma ^ sigma^2 is the identity)\n", r_sig);
 }
 
-// Plaintext run of the segmented, chained circuits; returns the final weights (and the AND count).
-static std::vector<int64_t> run_plain(const Params& P, uint64_t N, uint64_t* ands, uint64_t* segs, std::vector<std::vector<int64_t>>* per_iter) {
-  const SigmoidTable S = make_sigmoid_table(P.f);
+// Plaintext run of the segmented, chained circuits (loaded from `dir`); returns the final weights as float32.
+static std::vector<float> run_plain(const std::string& dir, const Params& P, uint64_t N, uint64_t* ands, uint64_t* segs, std::vector<std::vector<float>>* per_iter) {
   const Dataset D = generate_client_data(P);
   const auto sh = w0_shares(P, generate_initial_weights(P));
-  Layout prev;
   std::vector<uint8_t> carried;
-  std::vector<int64_t> w;
+  std::vector<float> w;
   *ands = 0;
   *segs = 0;
   for (int t = 0; t < P.iters; ++t) {
-    IterCircuit IC = build_iteration(P, S, t, prev);
+    const IterCircuit IC = load_iteration(dir, P, t == 0);
     *ands += IC.C.ands;
     std::vector<uint8_t> in = carried;
-    for (int k = 0; k < P.batch; ++k) {
+    for (int k = 0; k < kBatch; ++k) {
       CHECK(IC.start[(size_t)k + 2] == in.size(), "client %d input block starts at %u, expected %zu", k + 1, IC.start[(size_t)k + 2], in.size());
       client_bits(in, P, D, sh, k, t);
+      CHECK(IC.end[(size_t)k + 2] == in.size(), "client %d input block ends at %u, expected %zu", k + 1, IC.end[(size_t)k + 2], in.size());
     }
     const auto sgs = segment(IC.C, N);
     *segs += sgs.size();
@@ -111,54 +111,60 @@ static std::vector<int64_t> run_plain(const Params& P, uint64_t N, uint64_t* and
     }
     std::vector<uint8_t> out;
     for (uint32_t g = IC.C.num_wire - IC.C.n_out; g < IC.C.num_wire; ++g) out.push_back(val.at(g));
-    w = decode(IC.out_w, out);
+    w.assign((size_t)P.d, 0.0f);
+    for (int j = 0; j < P.d; ++j) {
+      uint32_t u = 0;
+      for (int b = 0; b < 32; ++b) u |= (uint32_t)out[(size_t)(32 * j + b)] << b;
+      w[(size_t)j] = u2f(u);
+    }
     if (per_iter) per_iter->push_back(w);
     carried = out;
-    prev = IC.out_w;
   }
   return w;
 }
 
-static void test_circuits(bool quick) {
-  std::printf("[per-iteration circuits + segmentation vs reference_train]\n");
-  struct Cfg { int d, iters, batch, qbits; double lr; bool bias, zero; uint64_t seed; };
-  std::vector<Cfg> cfgs = {{5, 20, 4, 6, 0.5, true, false, 1}, {1, 3, 4, 6, 0.5, true, false, 2}, {2, 5, 1, 6, 0.25, true, false, 3},
-                           {7, 6, 2, 6, 1.0, false, true, 4}, {3, 4, 3, 8, 0.75, true, false, 5}, {16, 4, 4, 6, 0.5, true, false, 6}};
-  if (!quick) { cfgs.push_back({50, 3, 4, 6, 0.5, true, false, 7}); cfgs.push_back({5, 40, 4, 6, 1.0, true, false, 8}); cfgs.push_back({20, 5, 8, 6, 2.0, true, false, 9}); }
+static bool same_bits(const std::vector<float>& a, const std::vector<float>& b) {
+  if (a.size() != b.size()) return false;
+  for (size_t i = 0; i < a.size(); ++i) if (f2u(a[i]) != f2u(b[i])) return false;
+  return true;
+}
+
+// The circuit files come from gen/gen_circuit (emp-tool 1.0): scripts/gen_circuits.sh --d "..." writes them to `dir`.
+static void test_circuits(const std::string& dir, bool quick) {
+  std::printf("[float32 per-iteration circuits (%s) + segmentation vs reference_train]\n", dir.c_str());
+  struct Cfg { int d, iters; uint64_t seed; };
+  std::vector<Cfg> cfgs = {{5, 20, 1}, {3, 4, 2}};
+  if (!quick) cfgs.push_back({12, 6, 3});
   for (const auto& c : cfgs) {
     Params P;
-    P.d = c.d; P.iters = c.iters; P.batch = c.batch; P.qbits = c.qbits; P.lr = c.lr; P.bias = c.bias; P.zero_init = c.zero; P.seed = c.seed;
-    try { P.finalize(); } catch (const std::exception& e) { std::printf("  skip (%s)\n", e.what()); continue; }
+    P.d = c.d; P.iters = c.iters; P.seed = c.seed;
+    P.finalize();
     RefTrace tr;
     const auto ref = reference_train(P, generate_client_data(P), generate_initial_weights(P), &tr);
-    for (uint64_t N : {uint64_t(1) << 40, uint64_t(20000), uint64_t(997), uint64_t(53)}) {
-      if (quick && N == 53 && c.d > 5) continue;
+    for (uint64_t N : {uint64_t(1) << 40, uint64_t(100000), uint64_t(9973)}) {
+      if (quick && N == 9973) continue;
       uint64_t ands = 0, segs = 0;
-      std::vector<std::vector<int64_t>> per;
-      const auto w = run_plain(P, N, &ands, &segs, &per);
+      std::vector<std::vector<float>> per;
+      std::vector<float> w;
+      try { w = run_plain(dir, P, N, &ands, &segs, &per); } catch (const std::exception& e) { CHECK(false, "%s", e.what()); return; }
       bool every = per.size() == tr.w_after.size();
-      for (size_t t = 0; every && t < per.size(); ++t) every = per[t] == tr.w_after[t];
-      CHECK(w == ref && every, "d=%d iters=%d batch=%d N=%" PRIu64 ": mismatch", c.d, c.iters, c.batch, N);
-      if (N == (uint64_t(1) << 40)) {
-        BristolRec R0;
-        R0.input(1);
-        Builder<BristolRec> B0(R0);
-        train_offline(B0, P, make_sigmoid_table(P.f), generate_client_data(P), generate_initial_weights(P));
-        // per-iteration circuits drop dead gates, so they can be slightly smaller than gc_ag2pc's single circuit
-        CHECK(ands <= B0.stats.ands, "AND count %" PRIu64 " > gc_ag2pc's %" PRIu64, ands, (uint64_t)B0.stats.ands);
-        if (ands != B0.stats.ands) std::printf("  (gc_ag2pc's circuit: %" PRIu64 " ANDs; %" PRIu64 " dead ANDs removed here)\n", (uint64_t)B0.stats.ands, (uint64_t)B0.stats.ands - ands);
-      }
-      std::printf("  d=%-3d iters=%-2d batch=%d qbits=%d lr=%.2f%s%s seg<=%-13" PRIu64 " ANDs=%-8" PRIu64 " segments=%-4" PRIu64 " %s\n", c.d, c.iters,
-                  c.batch, c.qbits, c.lr, c.bias ? "" : " no-bias", c.zero ? " zero-init" : "", N, ands, segs,
-                  (w == ref && every) ? "ok (every iteration bit-exact)" : "FAIL");
+      for (size_t t = 0; every && t < per.size(); ++t) every = same_bits(per[t], tr.w_after[t]);
+      CHECK(same_bits(w, ref) && every, "d=%d iters=%d N=%" PRIu64 ": mismatch", c.d, c.iters, N);
+      std::printf("  d=%-3d iters=%-2d seg<=%-13" PRIu64 " ANDs=%-9" PRIu64 " segments=%-4" PRIu64 " %s\n", c.d, c.iters, N, ands, segs,
+                  (same_bits(w, ref) && every) ? "ok (every iteration bit-exact)" : "FAIL");
     }
   }
 }
 
 int main(int argc, char** argv) {
-  const bool quick = argc > 1 && std::string(argv[1]) == "--quick";
+  bool quick = false;
+  std::string dir = "circuits";
+  for (int i = 1; i < argc; ++i) {
+    if (std::string(argv[i]) == "--quick") quick = true;
+    else if (std::string(argv[i]) == "--circuits" && i + 1 < argc) dir = argv[++i];
+  }
   test_gf();
-  test_circuits(quick);
+  test_circuits(dir, quick);
   if (g_fail) { std::printf("FAILED (%d)\n", g_fail); return 1; }
   std::printf("ALL PASSED\n");
   return 0;

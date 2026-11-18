@@ -6,7 +6,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 EMP_LEGACY_PREFIX="${EMP_LEGACY_PREFIX:-$HOME/emp-legacy}"
-NP_LIST="${NP_LIST:-2;3;5}"
+NP_LIST="${NP_LIST:-5}"
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DEMP_LEGACY_PREFIX="$EMP_LEGACY_PREFIX" -DAGMPC_NP_LIST="$NP_LIST"
 cmake --build build -j "${JOBS:-3}"
 echo "built: build/lr_gc_agmpc build/lr_gc_agmpc_selftest (party counts $NP_LIST)"

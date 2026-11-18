@@ -27,7 +27,7 @@ if(NOT _cfg MATCHES "EMP_AGMPC_HARDENED")
 endif()
 
 # Party counts (clients + 1) compiled in; each one is its own translation unit.
-set(AGMPC_NP_LIST "2;3;5" CACHE STRING "emp-agmpc party counts (batch + 1) to build")
+set(AGMPC_NP_LIST "5" CACHE STRING "emp-agmpc party counts to build (the float32 LR has batch 4 = 5 parties)")
 
 add_library(agmpc_common INTERFACE)
 target_include_directories(agmpc_common INTERFACE ${CMAKE_SOURCE_DIR}/include ${AGMPC_DIR})
@@ -35,7 +35,7 @@ target_include_directories(agmpc_common SYSTEM INTERFACE ${EMP_LEGACY_PREFIX}/in
 target_compile_features(agmpc_common INTERFACE cxx_std_20)
 # legacy emp headers predate some libstdc++ hygiene; -march=native for AES-NI / SSE as emp-base.cmake does
 target_compile_options(agmpc_common INTERFACE "SHELL:-include cstdint" "SHELL:-include memory" -march=native -maes -mrdseed
-                       -Wno-deprecated-declarations -Wno-ignored-attributes)
+                       -Wno-deprecated-declarations -Wno-ignored-attributes -ffp-contract=off)
 target_compile_definitions(agmpc_common INTERFACE EMP_CIRCUIT_PATH=${EMP_LEGACY_PREFIX}/include/emp-tool/circuits/files/)
 target_link_libraries(agmpc_common INTERFACE ${EMP_TOOL_LIB} OpenSSL::Crypto OpenSSL::SSL Threads::Threads)
 

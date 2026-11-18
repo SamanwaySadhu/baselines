@@ -59,12 +59,14 @@ template<typename T>
 void joinNclean(vector<future<T>>& res) {
 	for(auto &v: res) v.get();
 	res.clear();
+	g_round_barrier();
 }
 
 inline bool joinNcleanCheat(vector<future<bool>>& res) {
 	bool cheat = false;
 	for(auto &v: res) cheat = cheat or v.get();
 	res.clear();
+	g_round_barrier();
 	return cheat;
 }
 

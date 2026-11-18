@@ -17,11 +17,23 @@
 #include <chrono>
 #include <mutex>
 #include <netinet/in.h>
+#include <atomic>
 #include <netinet/tcp.h>
 #include <poll.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 using namespace emp;
+
+// Benchmark instrumentation (PATCHES.md P10): communication rounds. A round is one synchronized communication step:
+// a barrier of the protocol (joinNclean / joinNcleanCheat / echo_check) at which network bytes have moved since the
+// previous barrier. Independent pairwise exchanges inside one barrier run in parallel and count once.
+inline std::atomic<uint64_t> g_io_bytes{0};
+inline std::atomic<uint64_t> g_round_steps{0};
+inline std::atomic<uint64_t> g_round_last_bytes{0};
+inline void g_round_barrier() {
+	const uint64_t b = g_io_bytes.load();
+	if (b != g_round_last_bytes.exchange(b)) g_round_steps.fetch_add(1);
+}
 
 class SafeNetIO : public IOChannel<SafeNetIO> { public:
 	int consocket = -1;
@@ -96,6 +108,7 @@ class SafeNetIO : public IOChannel<SafeNetIO> { public:
 		if (fflush(stream) != 0) peer_failed("send");
 	}
 	void send_data_internal(const void* data, int len) {
+		g_io_bytes.fetch_add((uint64_t)len, std::memory_order_relaxed);
 		int sent = 0;
 		while (sent < len) {
 			const size_t res = fwrite(sent + (const char*)data, 1, (size_t)(len - sent), stream);
@@ -105,6 +118,7 @@ class SafeNetIO : public IOChannel<SafeNetIO> { public:
 		has_sent = true;
 	}
 	void recv_data_internal(void* data, int len) {
+		g_io_bytes.fetch_add((uint64_t)len, std::memory_order_relaxed);
 		if (has_sent) flush();
 		has_sent = false;
 		int got = 0;
@@ -236,6 +250,7 @@ class NetIOMP { public:
 			if (!digest_eq(D, R, 32)) agmpc_cheat(std::string("broadcast echo mismatch with ") + agmpc_party_name(j) + " (" + where + ")");
 		}
 		++g_echo_rounds;
+		g_round_barrier();
 	}
 };
 #endif //NETIOMP_H__

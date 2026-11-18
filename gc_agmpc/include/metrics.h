@@ -8,6 +8,7 @@
 #include <sys/resource.h>
 #include <time.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -46,6 +47,8 @@ struct PhaseRow {
   char name[32];
   double wall_s, cpu_s;
   uint64_t sent[kMaxParties], recv[kMaxParties];  // bytes sent to / received from each party
+  uint64_t runs[kMaxParties];                      // runs[0] = communication rounds (barriers with network traffic) in this phase
+  uint64_t rounds_max() const { return runs[0]; }
   uint64_t calls;
   uint64_t sent_total() const { uint64_t s = 0; for (uint64_t v : sent) s += v; return s; }
   uint64_t recv_total() const { uint64_t s = 0; for (uint64_t v : recv) s += v; return s; }
@@ -54,7 +57,7 @@ struct PhaseRow {
 class Recorder {
  public:
   // snap(sent, recv): cumulative bytes per peer right now
-  explicit Recorder(std::function<void(uint64_t*, uint64_t*)> snap) : snap_(std::move(snap)) {}
+  explicit Recorder(std::function<void(uint64_t*, uint64_t*, uint64_t*)> snap) : snap_(std::move(snap)) {}
   // Closes the current phase (if any) and starts `name`.
   void enter(const char* name) {
     close();
@@ -63,17 +66,17 @@ class Recorder {
   }
   void close() {
     if (cur_.empty()) return;
-    uint64_t s[kMaxParties] = {0}, r[kMaxParties] = {0};
-    if (snap_) snap_(s, r);
+    uint64_t s[kMaxParties] = {0}, r[kMaxParties] = {0}, q[kMaxParties] = {0};
+    if (snap_) snap_(s, r, q);
     PhaseRow& R = row(cur_.c_str());
     R.wall_s += wall_seconds() - w0_;
     R.cpu_s += cpu_seconds() - c0_;
-    for (int p = 0; p < kMaxParties; ++p) { R.sent[p] += s[p] - s0_[p]; R.recv[p] += r[p] - r0_[p]; }
+    for (int p = 0; p < kMaxParties; ++p) { R.sent[p] += s[p] - s0_[p]; R.recv[p] += r[p] - r0_[p]; R.runs[p] += q[p] - q0_[p]; }
     R.calls++;
     cur_.clear();
   }
   // Snapshot source changes (e.g. the network objects are created): restart the mark of the current phase.
-  void set_snap(std::function<void(uint64_t*, uint64_t*)> snap) { close_keep_name(); snap_ = std::move(snap); mark(); }
+  void set_snap(std::function<void(uint64_t*, uint64_t*, uint64_t*)> snap) { close_keep_name(); snap_ = std::move(snap); mark(); }
   const std::vector<PhaseRow>& rows() const { return rows_; }
 
  private:
@@ -83,7 +86,8 @@ class Recorder {
     c0_ = cpu_seconds();
     std::memset(s0_, 0, sizeof s0_);
     std::memset(r0_, 0, sizeof r0_);
-    if (snap_) snap_(s0_, r0_);
+    std::memset(q0_, 0, sizeof q0_);
+    if (snap_) snap_(s0_, r0_, q0_);
   }
   PhaseRow& row(const char* name) {
     for (auto& r : rows_)
@@ -94,16 +98,16 @@ class Recorder {
     rows_.push_back(r);
     return rows_.back();
   }
-  std::function<void(uint64_t*, uint64_t*)> snap_;
+  std::function<void(uint64_t*, uint64_t*, uint64_t*)> snap_;
   std::vector<PhaseRow> rows_;
   std::string cur_;
   double w0_ = 0, c0_ = 0;
-  uint64_t s0_[kMaxParties], r0_[kMaxParties];
+  uint64_t s0_[kMaxParties], r0_[kMaxParties], q0_[kMaxParties];
 };
 
 struct StageTotals {
   double wall_s = 0, cpu_s = 0;
-  uint64_t sent = 0, recv = 0;
+  uint64_t sent = 0, recv = 0, rounds = 0;  // rounds, summed over phases
 };
 inline StageTotals stage_totals(const std::vector<PhaseRow>& rows, const char* stage) {
   StageTotals t;
@@ -114,6 +118,7 @@ inline StageTotals stage_totals(const std::vector<PhaseRow>& rows, const char* s
       t.cpu_s += r.cpu_s;
       t.sent += r.sent_total();
       t.recv += r.recv_total();
+      t.rounds += r.rounds_max();
     }
   return t;
 }

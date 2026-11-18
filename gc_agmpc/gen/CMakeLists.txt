@@ -1,0 +1,12 @@
+cmake_minimum_required(VERSION 3.21)
+project(gen_circuit LANGUAGES CXX)
+if(NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE Release)
+endif()
+# Needs emp-tool 1.0 (the one gc_ag2pc uses, e.g. -DCMAKE_PREFIX_PATH=$HOME/emp).
+find_package(emp-tool 1.0 CONFIG REQUIRED)
+add_executable(gen_circuit gen_circuit.cpp)
+target_include_directories(gen_circuit PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+target_link_libraries(gen_circuit PRIVATE emp-tool::emp-tool)
+target_compile_features(gen_circuit PRIVATE cxx_std_20)
+target_compile_options(gen_circuit PRIVATE -ffp-contract=off)

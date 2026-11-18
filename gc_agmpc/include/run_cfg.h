@@ -15,6 +15,7 @@ struct RunCfg {
   int port = 12345;
   int ssp = 40;
   uint64_t seg_ands = 280000;
+  std::string circuit_dir = "circuits";  // gen_circuit output (scripts/gen_circuits.sh)
   int threads = 0;        // thread-pool size (0 = 2 (nP - 1) + 2)
   bool verify = false, quiet = false;
   std::string json, csv;

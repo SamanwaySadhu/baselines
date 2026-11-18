@@ -27,11 +27,12 @@ static void usage() {
       "training (every party must pass the same values):\n"
       "  --d N          features including the bias column (default 5)\n"
       "  --iters N      SGD iterations (default 20)\n"
-      "  --batch N      datapoints per iteration = number of clients (default 4)\n"
-      "  --qbits N  --lr X  --no-bias  --zero-init  --seed N   (as in gc_ag2pc; --seed/--zero-init shape the clients' test data)\n"
+      "  --seed N       seed of the clients' test data and initial weights\n"
+      "  (float32 IEEE binary32 throughout; batch = 4 clients, one datapoint each per iteration; lr 0.01)\n"
       "protocol:\n"
       "  --hosts H1,...,Hn   IPv4 of party 1 (server), 2 (client 1), ... (default all 127.0.0.1)\n"
       "  --port BASE    first TCP port; the run uses about 4 (n^2 + n) ports from BASE (default 12345)\n"
+      "  --circuits DIR directory of the circuit files made by scripts/gen_circuits.sh (default circuits)\n"
       "  --ssp N        statistical security parameter (default 40)\n"
       "  --seg-ands N   ANDs per emp-agmpc circuit; each iteration is cut into segments (default 280000)\n"
       "  --threads N    thread-pool size per party (default and minimum 2 (n - 1) + 2)\n"
@@ -45,7 +46,7 @@ static void usage() {
 }
 
 static int dispatch(const RunCfg& C) {
-  switch (C.P.batch + 1) {
+  switch (kBatch + 1) {
 #ifdef AGMPC_HAVE_NP2
     case 2: return run_party<2>(C);
 #endif
@@ -71,8 +72,8 @@ static int dispatch(const RunCfg& C) {
     case 9: return run_party<9>(C);
 #endif
     default:
-      throw std::invalid_argument("this build does not support batch " + std::to_string(C.P.batch) +
-                                  " (rebuild with -DAGMPC_NP_LIST including " + std::to_string(C.P.batch + 1) + ")");
+      throw std::invalid_argument("this build does not support batch " + std::to_string(kBatch) +
+                                  " (rebuild with -DAGMPC_NP_LIST including " + std::to_string(kBatch + 1) + ")");
   }
 }
 
@@ -93,6 +94,7 @@ int main(int argc, char** argv) {
       if (a == "--id") id = (int)parse_int(r.next_value(a), a);
       else if (a == "--hosts") hosts = r.next_value(a);
       else if (a == "--port") C.port = (int)parse_int(r.next_value(a), a);
+      else if (a == "--circuits") C.circuit_dir = r.next_value(a);
       else if (a == "--ssp") C.ssp = (int)parse_int(r.next_value(a), a);
       else if (a == "--seg-ands") C.seg_ands = (uint64_t)parse_int(r.next_value(a), a);
       else if (a == "--threads") C.threads = (int)parse_int(r.next_value(a), a);
@@ -112,15 +114,15 @@ int main(int argc, char** argv) {
       if (id != 0) throw std::invalid_argument("--id is for clients");
       C.party = 1;
     } else {
-      if (id < 1 || id > C.P.batch) throw std::invalid_argument("client --id must be in [1, batch]");
+      if (id < 1 || id > kBatch) throw std::invalid_argument("client --id must be in [1, batch]");
       C.party = id + 1;
       if (C.verify || !C.csv.empty() || !C.json.empty()) throw std::invalid_argument("--verify/--csv/--json are server options");
     }
     if (C.ssp < 1 || C.ssp > 128) throw std::invalid_argument("--ssp must be in [1, 128]");
     if (C.seg_ands < 1) throw std::invalid_argument("--seg-ands must be >= 1");
-    if (C.port < 1024 || C.port + 4 * (C.P.batch + 1) * (C.P.batch + 2) + 8 > 65535) throw std::invalid_argument("--port out of range");
+    if (C.port < 1024 || C.port + 4 * (kBatch + 1) * (kBatch + 2) + 8 > 65535) throw std::invalid_argument("--port out of range");
     if (g_agmpc.connect_timeout_s < 1 || g_agmpc.timeout_s < 1) throw std::invalid_argument("timeouts must be >= 1 s");
-    g_agmpc.hosts.assign((size_t)C.P.batch + 2, "127.0.0.1");
+    g_agmpc.hosts.assign((size_t)kBatch + 2, "127.0.0.1");
     if (!hosts.empty()) {
       std::stringstream ss(hosts);
       std::string h;
